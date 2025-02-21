@@ -310,7 +310,7 @@ class ChatCompletionRequest(BaseModel):
     max_tokens: Optional[int] = None
     n: int = 1
     presence_penalty: float = 0.0
-    response_format: Union[ResponseFormat, StructuralTagResponseFormat] = None
+    response_format: Union[ResponseFormat, StructuralTagResponseFormat, None] = None
     seed: Optional[int] = None
     stop: Optional[Union[str, List[str]]] = None
     stream: bool = False

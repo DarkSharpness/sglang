@@ -158,7 +158,7 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
                     tags, structural_tag["triggers"]
                 )
             except RuntimeError as e:
-                logging.warning(f"Skip invalid regex: regex={key_string}, {e=}")
+                logging.warning(f"Skip invalid tag: tag={key_string}, {e=}")
                 return None
         else:
             raise ValueError(f"Invalid key_type: {key_type}")
