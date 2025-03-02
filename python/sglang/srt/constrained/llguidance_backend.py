@@ -14,6 +14,7 @@
 """Constrained decoding with llguidance backend."""
 
 import json
+import logging
 import os
 from typing import List, Optional, Tuple
 
@@ -27,6 +28,8 @@ from sglang.srt.constrained.base_grammar_backend import (
     BaseGrammarBackend,
     BaseGrammarObject,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class GuidanceGrammar(BaseGrammarObject):
@@ -139,6 +142,9 @@ class GuidanceBackend(BaseGrammarBackend):
         elif mode == "ebnf":
             compiler = llguidance.LarkCompiler()
             serialized_grammar = compiler.compile(any_to_lark(value))
+        else:
+            logger.warning(f"Skip unsupported {mode}={value}")
+            return None
 
         return GuidanceGrammar(
             llguidance_tokenizer=self.llguidance_tokenizer,

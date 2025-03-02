@@ -158,6 +158,9 @@ class OutlinesGrammarBackend(BaseGrammarBackend):
                 return None
         elif key_type == "regex":
             regex = key_string
+        elif key_type in ["ebnf", "structural_tag"]:
+            logger.warning(f"Skip unsupported {key_type}={key_string}")
+            return None
         else:
             raise ValueError(f"Invalid key_type: {key_type}")
 
