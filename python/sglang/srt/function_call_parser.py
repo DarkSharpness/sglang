@@ -3,11 +3,12 @@ import logging
 import re
 from abc import ABC, abstractmethod
 from json import JSONDecodeError, JSONDecoder
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Callable
 
 import partial_json_parser
 from partial_json_parser.core.options import Allow
 from pydantic import BaseModel, Field
+from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
 
@@ -74,8 +75,21 @@ class StreamingParseResult:
         self.normal_text = normal_text
         self.calls = calls or []
 
+@dataclass
+class StructureInfo:
+    begin: str
+    finish: str
+    trigger: str
 
-class BaseFormatDetector:
+_GetInfoFunc = Callable[[str], StructureInfo]
+"""
+helper alias of function
+ususally it is a function that takes a name string and returns a StructureInfo object,
+which can be used to construct a structural_tag object
+"""
+
+
+class BaseFormatDetector(ABC):
     """Base class providing two sets of interfaces: one-time and streaming incremental."""
 
     def __init__(self):
@@ -129,6 +143,7 @@ class BaseFormatDetector:
 
         return results
 
+    @abstractmethod
     def detect_and_parse(self, text: str, tools: List[Function]) -> List[ToolCallItem]:
         """
         Parses the text in one go. Returns success=True if the format matches, otherwise False.
@@ -303,6 +318,9 @@ class BaseFormatDetector:
             logger.error(f"Error in parse_streaming_increment: {e}")
             return StreamingParseResult()
 
+    @abstractmethod
+    def structure_info(self) -> _GetInfoFunc:
+        raise NotImplementedError()
 
 class Qwen25Detector(BaseFormatDetector):
     """
@@ -337,6 +355,12 @@ class Qwen25Detector(BaseFormatDetector):
             calls.extend(self.parse_base_json(match_result, tools))
         return calls
 
+    def structure_info(self) -> _GetInfoFunc:
+        return lambda name: StructureInfo(
+            begin='<tool_call>{"name":"' + name + '", "arguments":',
+            finish='}</tool_call>',
+            trigger='<tool_call>',
+        )
 
 class MistralDetector(BaseFormatDetector):
     """
@@ -386,6 +410,12 @@ class MistralDetector(BaseFormatDetector):
                 calls.extend(self.parse_base_json(match_result, tools))
         return calls
 
+    def structure_info(self) -> _GetInfoFunc:
+        return lambda name: StructureInfo(
+            begin='[TOOL_CALLS] [{"name":"' + name + '", "arguments":',
+            finish='}]',
+            trigger='[TOOL_CALLS]',
+        )
 
 class Llama32Detector(BaseFormatDetector):
     """
@@ -425,6 +455,12 @@ class Llama32Detector(BaseFormatDetector):
 
         return []
 
+    def structure_info(self) -> _GetInfoFunc:
+        return lambda name: StructureInfo(
+            begin='<|python_tag|>{"name":"' + name + '", "arguments":',
+            finish='}',
+            trigger='<|python_tag|>',
+        )
 
 class MultiFormatParser:
     def __init__(self, detectors: List[BaseFormatDetector]):
@@ -482,13 +518,13 @@ class FunctionCallParser:
     and returns the resulting normal_text and calls to the upper layer (or SSE).
     """
 
-    ToolCallParserEnum: Dict[str, BaseFormatDetector] = {
+    ToolCallParserEnum: Dict[str, type[BaseFormatDetector]] = {
         "llama3": Llama32Detector,
         "qwen25": Qwen25Detector,
         "mistral": MistralDetector,
     }
 
-    def __init__(self, tools: List[Function], tool_call_parser: str = None):
+    def __init__(self, tools: List[Function], tool_call_parser: str):
         detectors = []
         if tool_call_parser:
             detector_class = self.ToolCallParserEnum.get(tool_call_parser)
@@ -519,3 +555,9 @@ class FunctionCallParser:
             chunk_text, self.tools
         )
         return normal_text, calls
+
+    def structure_infos(self) -> List[_GetInfoFunc]:
+        """
+        Returns a list of structure_info functions for each detector
+        """
+        return [detector.structure_info() for detector in self.multi_format_parser.detectors]
