@@ -54,7 +54,7 @@ def transfer_kv_to_cpu_all_layer_naive(
     page_size: int,
     layer_num: int,
 ):
-    torch.ops.sgl_kernel.transfer_kv_to_cpu_all_layer_naive(
+    torch.ops.sgl_kernel.transfer_kv_to_cpu_all_layer_naive.default(
         host_indices,
         host_k_buffer,
         host_v_buffer,
@@ -76,7 +76,7 @@ def transfer_kv_to_gpu_per_layer_naive(
     page_size: int,
     layer_id: int,
 ):
-    torch.ops.sgl_kernel.transfer_kv_to_gpu_per_layer_naive(
+    torch.ops.sgl_kernel.transfer_kv_to_gpu_per_layer_naive.default(
         host_indices,
         host_k_buffer,
         host_v_buffer,
