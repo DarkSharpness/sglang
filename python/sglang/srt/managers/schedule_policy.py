@@ -89,6 +89,7 @@ class SchedulePolicy:
             req_to_token_pool=None,
             token_to_kv_pool_allocator=None,
             page_size=1,
+            evict_policy="fifo",
             disable=False,
         )
 

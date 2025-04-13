@@ -77,6 +77,7 @@ class ServerArgs:
     schedule_conservativeness: float = 1.0
     cpu_offload_gb: int = 0
     page_size: int = 1
+    evict_policy: str = "fifo"
 
     # Other runtime options
     tp_size: int = 1
@@ -1121,6 +1122,13 @@ class ServerArgs:
             type=str,
             choices=["normal", "low_latency", "auto"],
             help="Select the mode when enable DeepEP MoE, could be `normal`, `low_latency` or `auto`. Default is `auto`, which means `low_latency` for decode batch and `normal` for prefill batch.",
+        )
+        parser.add_argument(
+            "--evict-policy",
+            type=str,
+            choices=["fifo", "fair"],
+            default=ServerArgs.evict_policy,
+            help="Eviction policy of radix cache.",
         )
 
         # Server warmups

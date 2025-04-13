@@ -29,6 +29,7 @@ class HiRadixCache(RadixCache):
         token_to_kv_pool_allocator: TokenToKVPoolAllocator,
         tp_cache_group: torch.distributed.ProcessGroup,
         page_size: int,
+        evict_policy: str,
         hicache_ratio: float,
         hicache_size: int,
         hicache_write_policy: str,
@@ -77,7 +78,11 @@ class HiRadixCache(RadixCache):
         self.load_back_threshold = 10
         self.tree_cpp = hiradix_schedule_utils.HiRadixCache_CPP()
         super().__init__(
-            req_to_token_pool, token_to_kv_pool_allocator, page_size, disable=False
+            req_to_token_pool=req_to_token_pool,
+            token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+            page_size=page_size,
+            evict_policy=evict_policy,
+            disable=False
         )
 
     def reset(self):

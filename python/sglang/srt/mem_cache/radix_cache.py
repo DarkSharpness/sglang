@@ -102,12 +102,15 @@ class RadixCache(BasePrefixCache):
         req_to_token_pool: ReqToTokenPool,
         token_to_kv_pool_allocator: TokenToKVPoolAllocator,
         page_size: int,
+        evict_policy: str,
         disable: bool = False,
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.page_size = page_size
         self.disable = disable
+        self.evict_policy = evict_policy
+        assert self.evict_policy in ["fifo", "fair"]
 
         if self.token_to_kv_pool_allocator:
             self.device = self.token_to_kv_pool_allocator.device
@@ -266,9 +269,45 @@ class RadixCache(BasePrefixCache):
     def total_size(self):
         return self._total_size_helper()
 
+    def _evict_fair(self, num_tokens: int):
+        candidate_list = self._collect_leaves()
+        num_evicted = 0
+
+        MIN_EVICT_AT_ONCE = 50
+        while num_evicted < num_tokens and len(candidate_list):
+            evict_once = 1600
+            leaves, candidate_list = candidate_list, []
+            heapq.heapify(leaves)
+            while evict_once > 0 and num_evicted < num_tokens and len(leaves):
+                x = heapq.heappop(leaves)
+                if x == self.root_node:
+                    break
+                if x.lock_ref > 0:
+                    continue
+                assert isinstance(x.value, torch.Tensor)
+                num_remain = len(x.value)
+                if self.page_size != 1 or num_remain <= evict_once + MIN_EVICT_AT_ONCE:
+                    self.token_to_kv_pool_allocator.free(x.value)
+                    num_evicted += num_remain
+                    self._delete_leaf(x)
+                    if len(x.parent.children) == 0:
+                        heapq.heappush(leaves, x.parent)
+                else: # split the node, remove the last MAX_EVICT_AT_ONCE tokens
+                    num_remain -= evict_once
+                    x.key = x.key[:num_remain]
+                    x.value, to_evict = x.value.split((num_remain, evict_once))
+                    self.token_to_kv_pool_allocator.free(to_evict)
+                    num_evicted += evict_once
+                    self.evictable_size_ -= evict_once
+                    candidate_list.append(x) # may be evicted in the next round
+                    evict_once -= MIN_EVICT_AT_ONCE
+
     def evict(self, num_tokens: int):
         if self.disable:
             return
+
+        if self.evict_policy == "fair":
+            return self._evict_fair(num_tokens)
 
         leaves = self._collect_leaves()
         heapq.heapify(leaves)

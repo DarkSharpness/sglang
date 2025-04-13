@@ -479,12 +479,14 @@ class Scheduler(
                     hicache_size=server_args.hicache_size,
                     hicache_write_policy=server_args.hicache_write_policy,
                     hicache_oracle=self.hicache_oracle,
+                    evict_policy=server_args.evict_policy,
                 )
             else:
                 self.tree_cache = RadixCache(
                     req_to_token_pool=self.req_to_token_pool,
                     token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                     page_size=self.page_size,
+                    evict_policy=server_args.evict_policy,
                     disable=server_args.disable_radix_cache,
                 )
 
