@@ -19,11 +19,12 @@ limitations under the License.
 The radix tree data structure for managing the KV cache.
 """
 
+from dataclasses import dataclass
 import heapq
 import time
 from collections import defaultdict
 from functools import partial
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
 
@@ -41,9 +42,9 @@ class TreeNode:
 
     def __init__(self, id: Optional[int] = None):
         self.children = defaultdict(TreeNode)
-        self.parent = None
-        self.key = None
-        self.value = None
+        self.parent: TreeNode = None
+        self.key: List = None
+        self.value: torch.Tensor = None
         self.lock_ref = 0
         self.last_access_time = time.time()
 
@@ -58,6 +59,13 @@ class TreeNode:
 
         self.id = TreeNode.counter if id is None else id
         TreeNode.counter += 1
+
+        # evict fairness counter
+        self._evict_count = 0
+
+    def access(self):
+        self._evict_count = 0
+        self.last_access_time = time.time()
 
     @property
     def evicted(self):
@@ -95,6 +103,19 @@ def _key_match_paged(key0: List, key1: List, page_size: int):
 
     return i
 
+RATIO = 0.01
+
+class SortNode:
+    def __init__(self, node: TreeNode, rank_map: Dict[float, int]):
+        self.node = node
+        self.rank = rank_map[node.last_access_time] + node._evict_count * RATIO
+
+    def evict(self, count: int):
+        self.node._evict_count += count
+        self.rank += count * RATIO
+
+    def __lt__(self, other: SortNode):
+        return self.rank < other.rank
 
 class RadixCache(BasePrefixCache):
     def __init__(
@@ -270,37 +291,37 @@ class RadixCache(BasePrefixCache):
         return self._total_size_helper()
 
     def _evict_fair(self, num_tokens: int):
-        candidate_list = self._collect_leaves()
+        tree_list, rank_map = self._collect_leaves_and_rank()
         num_evicted = 0
-
-        MIN_EVICT_AT_ONCE = 50
-        while num_evicted < num_tokens and len(candidate_list):
-            evict_once = 1600
-            leaves, candidate_list = candidate_list, []
-            heapq.heapify(leaves)
-            while evict_once > 0 and num_evicted < num_tokens and len(leaves):
-                x = heapq.heappop(leaves)
-                if x == self.root_node:
-                    break
-                if x.lock_ref > 0:
-                    continue
-                assert isinstance(x.value, torch.Tensor)
-                num_remain = len(x.value)
-                if self.page_size != 1 or num_remain <= evict_once + MIN_EVICT_AT_ONCE:
-                    self.token_to_kv_pool_allocator.free(x.value)
-                    num_evicted += num_remain
-                    self._delete_leaf(x)
-                    if len(x.parent.children) == 0:
-                        heapq.heappush(leaves, x.parent)
-                else: # split the node, remove the last MAX_EVICT_AT_ONCE tokens
-                    num_remain -= evict_once
-                    x.key = x.key[:num_remain]
-                    x.value, to_evict = x.value.split((num_remain, evict_once))
-                    self.token_to_kv_pool_allocator.free(to_evict)
-                    num_evicted += evict_once
-                    self.evictable_size_ -= evict_once
-                    candidate_list.append(x) # may be evicted in the next round
-                    evict_once -= MIN_EVICT_AT_ONCE
+        leaves = [SortNode(node, rank_map) for node in tree_list]
+        heapq.heapify(leaves)
+        MAX_EVICT = 1024
+        EVICT_THRESHOLD = 1024 + 64
+        assert MAX_EVICT % self.page_size == 0, "MAX_EVICT should be page aligned"
+        while num_evicted < num_tokens and len(leaves):
+            y = heapq.heappop(leaves)
+            x = y.node
+            if x == self.root_node:
+                break
+            if x.lock_ref > 0:
+                continue
+            if (num_remain := len(x.key)) <= EVICT_THRESHOLD:
+                self.token_to_kv_pool_allocator.free(x.value)
+                num_evicted += num_remain
+                self._delete_leaf(x)
+                if len(x.parent.children) == 0:
+                    x.parent._evict_count = x._evict_count + num_remain
+                    heapq.heappush(leaves, SortNode(x.parent, rank_map))
+            else:
+                # only evict a small part of the node
+                num_remain -= MAX_EVICT
+                x.key = x.key[:num_remain]
+                x.value, to_evict = x.value.split((num_remain, MAX_EVICT))
+                self.token_to_kv_pool_allocator.free(to_evict)
+                num_evicted += MAX_EVICT
+                self.evictable_size_ -= MAX_EVICT
+                y.evict(MAX_EVICT)
+                heapq.heappush(leaves, y)
 
     def evict(self, num_tokens: int):
         if self.disable:
@@ -377,14 +398,14 @@ class RadixCache(BasePrefixCache):
     ##### Internal Helper Functions #####
 
     def _match_prefix_helper(self, node: TreeNode, key: List):
-        node.last_access_time = time.time()
+        node.access()
 
         child_key = self.get_child_key_fn(key)
 
         value = []
         while len(key) > 0 and child_key in node.children.keys():
             child = node.children[child_key]
-            child.last_access_time = time.time()
+            child.access()
             prefix_len = self.key_match_fn(child.key, key)
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
@@ -416,7 +437,7 @@ class RadixCache(BasePrefixCache):
         return new_node
 
     def _insert_helper(self, node: TreeNode, key: List, value):
-        node.last_access_time = time.time()
+        node.access()
         if len(key) == 0:
             return 0
 
@@ -425,7 +446,7 @@ class RadixCache(BasePrefixCache):
         total_prefix_length = 0
         while len(key) > 0 and child_key in node.children.keys():
             node = node.children[child_key]
-            node.last_access_time = time.time()
+            node.access()
             prefix_len = self.key_match_fn(node.key, key)
             total_prefix_length += prefix_len
             key = key[prefix_len:]
@@ -498,6 +519,20 @@ class RadixCache(BasePrefixCache):
 
         return ret_list
 
+    def _collect_leaves_and_rank(self):
+        ret_list: List[TreeNode] = []
+        time_list: List[float] = []
+        stack = [self.root_node]
+        while stack:
+            cur_node = stack.pop()
+            time_list.append(cur_node.last_access_time)
+            if len(cur_node.children) == 0:
+                ret_list.append(cur_node)
+            else:
+                stack.extend(cur_node.children.values())
+
+        time_list = sorted(time_list)
+        return ret_list, {t: i for i, t in enumerate(time_list)}
 
 if __name__ == "__main__":
     tree = RadixCache(None, None, page_size=1, disable=False)
