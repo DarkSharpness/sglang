@@ -103,16 +103,18 @@ def _key_match_paged(key0: List, key1: List, page_size: int):
 
     return i
 
-RATIO = 0.01
+MAX_EVICT = 1024
+EVICT_THRESHOLD = 1024 + 128
+RATIO = 100
 
 class SortNode:
     def __init__(self, node: TreeNode, rank_map: Dict[float, int]):
         self.node = node
-        self.rank = rank_map[node.last_access_time] + node._evict_count * RATIO
+        self.rank = rank_map[node.last_access_time] + (node._evict_count // MAX_EVICT) * RATIO
 
-    def evict(self, count: int):
-        self.node._evict_count += count
-        self.rank += count * RATIO
+    def evict_max(self):
+        self.node._evict_count += MAX_EVICT
+        self.rank += RATIO
 
     def __lt__(self, other: SortNode):
         return self.rank < other.rank
@@ -132,6 +134,8 @@ class RadixCache(BasePrefixCache):
         self.disable = disable
         self.evict_policy = evict_policy
         assert self.evict_policy in ["fifo", "fair"]
+        if self.evict_policy == "fair":
+            assert MAX_EVICT % page_size == 0, "MAX_EVICT should be page aligned"
 
         if self.token_to_kv_pool_allocator:
             self.device = self.token_to_kv_pool_allocator.device
@@ -295,9 +299,6 @@ class RadixCache(BasePrefixCache):
         num_evicted = 0
         leaves = [SortNode(node, rank_map) for node in tree_list]
         heapq.heapify(leaves)
-        MAX_EVICT = 1024
-        EVICT_THRESHOLD = 1024 + 64
-        assert MAX_EVICT % self.page_size == 0, "MAX_EVICT should be page aligned"
         while num_evicted < num_tokens and len(leaves):
             y = heapq.heappop(leaves)
             x = y.node
@@ -315,12 +316,12 @@ class RadixCache(BasePrefixCache):
             else:
                 # only evict a small part of the node
                 num_remain -= MAX_EVICT
+                num_evicted += MAX_EVICT
+                self.evictable_size_ -= MAX_EVICT
                 x.key = x.key[:num_remain]
                 x.value, to_evict = x.value.split((num_remain, MAX_EVICT))
                 self.token_to_kv_pool_allocator.free(to_evict)
-                num_evicted += MAX_EVICT
-                self.evictable_size_ -= MAX_EVICT
-                y.evict(MAX_EVICT)
+                y.evict_max()
                 heapq.heappush(leaves, y)
 
     def evict(self, num_tokens: int):
