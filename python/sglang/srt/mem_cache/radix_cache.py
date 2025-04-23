@@ -41,10 +41,10 @@ class TreeNode:
     counter = 0
 
     def __init__(self, id: Optional[int] = None):
-        self.children = defaultdict(TreeNode)
+        self.children: Dict = defaultdict(TreeNode)
         self.parent: TreeNode = None
         self.key: List = None
-        self.value: torch.Tensor = None
+        self.value: torch.Tensor | None = None
         self.lock_ref = 0
         self.last_access_time = time.time()
 
@@ -52,7 +52,7 @@ class TreeNode:
         # indicating the node is loading KV cache from host
         self.loading = False
         # store the host indices of KV cache
-        self.host_value = None
+        self.host_value: torch.Tensor | None = None
 
         # indicating the node is removed from the tree but may still be referenced
         self.dangling = False
@@ -302,6 +302,7 @@ class RadixCache(BasePrefixCache):
         while num_evicted < num_tokens and len(leaves):
             y = heapq.heappop(leaves)
             x = y.node
+            assert x.value is not None
             if x == self.root_node:
                 break
             if x.lock_ref > 0:

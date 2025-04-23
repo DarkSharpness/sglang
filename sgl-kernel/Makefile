@@ -16,7 +16,6 @@ tree: ## Show project directory structure
 	@tree --prune -I "__pycache__|*.egg-info|*.so|build|3rdparty|dist"
 
 submodule: ## Initialize and update git submodules
-	@git submodule update --init --recursive
 
 ln: submodule ## Create compilation database
 	@rm -rf build && mkdir build && cd build && cmake .. -DCMAKE_EXPORT_COMPILE_COMMANDS=YES

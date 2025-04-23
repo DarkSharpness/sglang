@@ -16,7 +16,7 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
     TokenToKVPoolAllocator,
 )
-from sglang.srt.mem_cache.radix_cache import RadixCache, TreeNode
+from sglang.srt.mem_cache.radix_cache import RadixCache, TreeNode, SortNode, EVICT_THRESHOLD, MAX_EVICT
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +84,10 @@ class HiRadixCache(RadixCache):
             evict_policy=evict_policy,
             disable=False
         )
+        if evict_policy == "fair":
+            assert self.cache_controller.write_policy != "write_back", (
+                "Don't support fair eviction with write back policy yet"
+            )
 
     def reset(self):
         TreeNode.reset_counter()
@@ -177,7 +181,69 @@ class HiRadixCache(RadixCache):
     def evictable_size(self):
         return self.evictable_size_
 
+    def _evict_fair_hicache(self, num_tokens: int):
+        tree_list, rank_map = self._collect_leaves_and_rank_device()
+        num_evicted = 0
+        leaves = [SortNode(node, rank_map) for node in tree_list]
+        heapq.heapify(leaves)
+        while num_evicted < num_tokens and len(leaves):
+            y = heapq.heappop(leaves)
+            x = y.node
+            if x.lock_ref > 0:
+                continue
+            assert x.value is not None, "can't evict a node without value"
+            if (num_remain := len(x.key)) <= EVICT_THRESHOLD:
+                if x.host_value is None: # no backup
+                    self.token_to_kv_pool_allocator.free(x.value)
+                    num_evicted += num_remain
+                    self._delete_leaf(x)
+                else:
+                    assert self.cache_controller.evict_device(x.value, x.host_value) == num_remain
+                    num_evicted += num_remain
+                    self.evictable_size_ -= num_remain
+                    x.value = None
+
+                for child in x.parent.children.values():
+                    if not child.evicted:
+                        break
+                else:
+                    x.parent._evict_count = x._evict_count + num_remain
+                    heapq.heappush(leaves, SortNode(x.parent, rank_map))
+            else:
+                num_remain -= MAX_EVICT
+                if x.host_value is None: # no backup
+                    num_evicted += MAX_EVICT
+                    self.evictable_size_ -= MAX_EVICT
+                    x.key = x.key[:num_remain]
+                    x.value, to_evict = x.value.split((num_remain, MAX_EVICT))
+                    self.token_to_kv_pool_allocator.free(to_evict)
+                    y.evict_max()
+                    heapq.heappush(leaves, y)
+                else:
+                    # need to split the node, the remaining part is not evictable
+                    z = TreeNode() # split node z
+                    z.lock_ref = x.lock_ref
+                    z.loading = x.loading
+                    z.key, x.key = x.key[:num_remain], x.key[num_remain:]
+                    z.value, x.value = x.value.split((num_remain, MAX_EVICT))
+                    z.host_value, x.host_value = x.host_value.split((num_remain, MAX_EVICT))
+                    z.children = {self.get_child_key_fn(x.key): x}
+                    z.parent = x.parent
+                    z.parent.children[self.get_child_key_fn(z.key)] = z
+                    x.parent = z
+                    z.last_access_time = x.last_access_time
+                    z._evict_count = x._evict_count + MAX_EVICT
+                    assert x.value is not None and x.host_value is not None
+                    assert self.cache_controller.evict_device(x.value, x.host_value) == MAX_EVICT
+                    num_evicted += MAX_EVICT
+                    self.evictable_size_ -= MAX_EVICT
+                    x.value = None
+                    heapq.heappush(leaves, SortNode(z, rank_map))
+
     def evict(self, num_tokens: int):
+        if self.evict_policy == "fair":
+            return self._evict_fair_hicache(num_tokens)
+
         leaves = self._collect_leaves_device()
         heapq.heapify(leaves)
 
@@ -499,3 +565,30 @@ class HiRadixCache(RadixCache):
                     if not cur_child.evicted:
                         stack.append(cur_child)
         return ret_list
+
+    def _collect_leaves_and_rank_device(self):
+        def is_leaf(node: TreeNode):
+            if node.evicted:
+                return False
+            if node == self.root_node:
+                return False
+            if len(node.children) == 0:
+                return True
+            for child in node.children.values():
+                if not child.evicted:
+                    return False
+            return True
+
+        ret_list: List[TreeNode] = []
+        time_list: List[float] = []
+        stack = [self.root_node]
+        while stack:
+            cur_node = stack.pop()
+            time_list.append(cur_node.last_access_time)
+            if is_leaf(cur_node):
+                ret_list.append(cur_node)
+            else:
+                stack.extend(v for v in cur_node.children.values() if not v.evicted)
+
+        time_list = sorted(time_list)
+        return ret_list, {t: i for i, t in enumerate(time_list)}
