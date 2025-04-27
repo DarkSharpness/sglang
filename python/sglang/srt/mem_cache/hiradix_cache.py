@@ -192,16 +192,18 @@ class HiRadixCache(RadixCache):
             if x.lock_ref > 0:
                 continue
             assert x.value is not None, "can't evict a node without value"
-            if (num_remain := len(x.key)) <= EVICT_THRESHOLD:
+            if x.host_value is None or (num_remain := len(x.key)) <= EVICT_THRESHOLD:
                 if x.host_value is None: # no backup
                     self.token_to_kv_pool_allocator.free(x.value)
                     num_evicted += num_remain
                     self._delete_leaf(x)
+                    self.tree_cpp.delete_node(x.id)
                 else:
                     assert self.cache_controller.evict_device(x.value, x.host_value) == num_remain
                     num_evicted += num_remain
                     self.evictable_size_ -= num_remain
                     x.value = None
+                    self.tree_cpp.evict_node(x.id)
 
                 for child in x.parent.children.values():
                     if not child.evicted:
@@ -212,6 +214,7 @@ class HiRadixCache(RadixCache):
             else:
                 num_remain -= MAX_EVICT
                 if x.host_value is None: # no backup
+                    assert False, "not supported yet"
                     num_evicted += MAX_EVICT
                     self.evictable_size_ -= MAX_EVICT
                     x.key = x.key[:num_remain]
@@ -238,6 +241,8 @@ class HiRadixCache(RadixCache):
                     num_evicted += MAX_EVICT
                     self.evictable_size_ -= MAX_EVICT
                     x.value = None
+                    self.tree_cpp.split_node(x.id, x.key, z.id, z.key)
+                    self.tree_cpp.evict_node(x.id)
                     heapq.heappush(leaves, SortNode(z, rank_map))
 
     def evict(self, num_tokens: int):
