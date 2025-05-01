@@ -47,6 +47,7 @@ from sglang.srt.function_call_parser import FunctionCallParser
 from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
     ConfigureLoggingReq,
+    DebugReq,
     EmbeddingReqInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
@@ -317,6 +318,11 @@ async def flush_cache():
         status_code=200,
     )
 
+@app.api_route("/debug", methods=["GET", "POST"])
+async def debug():
+    assert _global_state is not None
+    req = DebugReq()
+    _global_state.tokenizer_manager.send_to_scheduler.send_pyobj(req)
 
 @app.api_route("/start_profile", methods=["GET", "POST"])
 async def start_profile_async(obj: Optional[ProfileReqInput] = None):

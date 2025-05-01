@@ -58,6 +58,7 @@ from sglang.srt.managers.expert_distribution import ExpertDistributionRecorder
 from sglang.srt.managers.io_struct import (
     AbortReq,
     CloseSessionReqInput,
+    DebugReq,
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
     FlushCacheReq,
@@ -393,6 +394,7 @@ class Scheduler(
                 (TokenizedGenerateReqInput, self.handle_generate_request),
                 (TokenizedEmbeddingReqInput, self.handle_embedding_request),
                 (FlushCacheReq, self.flush_cache_wrapped),
+                (DebugReq, self.debug_wrapper),
                 (AbortReq, self.abort_request),
                 (OpenSessionReqInput, self.open_session),
                 (CloseSessionReqInput, self.close_session),
@@ -1658,6 +1660,9 @@ class Scheduler(
 
     def flush_cache_wrapped(self, recv_req: FlushCacheReq):
         self.flush_cache()
+
+    def debug_wrapper(self, recv_req: DebugReq):
+        self.tree_cache.debug() # type: ignore
 
     def flush_cache(self):
         """Flush the memory pool and cache."""

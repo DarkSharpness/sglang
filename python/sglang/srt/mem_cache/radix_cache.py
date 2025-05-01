@@ -161,6 +161,13 @@ class RadixCache(BasePrefixCache):
         self.protected_size_ = 0
         self.load_cache_event = None
 
+    def debug(self):
+        if self.evict_policy == "fair":
+            self.evict_policy = "fifo"
+        else:
+            self.evict_policy = "fair"
+        print(f"Current evict policy: {self.evict_policy}")
+
     def match_prefix(self, key: List[int], **kwargs) -> Tuple[torch.Tensor, int]:
         """Find the matching prefix from the radix tree.
         Args:

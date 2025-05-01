@@ -515,6 +515,10 @@ class BatchEmbeddingOut:
 
 
 @dataclass
+class DebugReq:
+    pass
+
+@dataclass
 class FlushCacheReq:
     pass
 

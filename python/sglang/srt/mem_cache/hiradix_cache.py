@@ -37,6 +37,7 @@ class HiRadixCache(RadixCache):
         hicache_oracle: bool = False,
     ):
         self.kv_cache = token_to_kv_pool_allocator.get_kvcache()
+        self.max_size: int = self.kv_cache.size # type: ignore
         if isinstance(self.kv_cache, MHATokenToKVPool):
             self.token_to_kv_pool_host = MHATokenToKVPoolHost(
                 self.kv_cache,
@@ -246,7 +247,7 @@ class HiRadixCache(RadixCache):
             self.tree_cpp.evict_node(x.id)
 
     def evict(self, num_tokens: int):
-        if self.evict_policy == "fair":
+        if self.evict_policy == "fair" and self.evictable_size_ > self.max_size // 4:
             return self._evict_fair_hicache(num_tokens)
 
         leaves = self._collect_leaves_device()
