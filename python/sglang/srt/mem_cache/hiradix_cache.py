@@ -1,8 +1,9 @@
+from collections import defaultdict
 import heapq
 import logging
 import threading
 import time
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import torch
 import hiradix_schedule_utils
@@ -186,21 +187,24 @@ class HiRadixCache(RadixCache):
         num_evicted = 0
         leaves = [SortNode(node, rank_map) for node in tree_list]
         heapq.heapify(leaves)
+        evicted: Dict[TreeNode, int] = defaultdict(int)
         while num_evicted < num_tokens and len(leaves):
             y = heapq.heappop(leaves)
             x = y.node
             if x.lock_ref > 0:
                 continue
             assert x.value is not None, "can't evict a node without value"
-            if x.host_value is None or (num_remain := len(x.key)) <= EVICT_THRESHOLD:
+            old_evict = evicted[x]
+            if (num_remain := len(x.key)) - old_evict <= EVICT_THRESHOLD or x.host_value is None:
+                # evict the whole node
+                num_evicted += num_remain - old_evict
+                evicted.pop(x, None)
                 if x.host_value is None: # no backup
                     self.token_to_kv_pool_allocator.free(x.value)
-                    num_evicted += num_remain
                     self._delete_leaf(x)
                     self.tree_cpp.delete_node(x.id)
                 else:
                     assert self.cache_controller.evict_device(x.value, x.host_value) == num_remain
-                    num_evicted += num_remain
                     self.evictable_size_ -= num_remain
                     x.value = None
                     self.tree_cpp.evict_node(x.id)
@@ -212,38 +216,34 @@ class HiRadixCache(RadixCache):
                     x.parent._evict_count = x._evict_count + num_remain
                     heapq.heappush(leaves, SortNode(x.parent, rank_map))
             else:
-                num_remain -= MAX_EVICT
-                if x.host_value is None: # no backup
-                    assert False, "not supported yet"
-                    num_evicted += MAX_EVICT
-                    self.evictable_size_ -= MAX_EVICT
-                    x.key = x.key[:num_remain]
-                    x.value, to_evict = x.value.split((num_remain, MAX_EVICT))
-                    self.token_to_kv_pool_allocator.free(to_evict)
-                    y.evict_max()
-                    heapq.heappush(leaves, y)
-                else:
-                    # need to split the node, the remaining part is not evictable
-                    z = TreeNode() # split node z
-                    z.lock_ref = x.lock_ref
-                    z.loading = x.loading
-                    z.key, x.key = x.key[:num_remain], x.key[num_remain:]
-                    z.value, x.value = x.value.split((num_remain, MAX_EVICT))
-                    z.host_value, x.host_value = x.host_value.split((num_remain, MAX_EVICT))
-                    z.children = {self.get_child_key_fn(x.key): x}
-                    z.parent = x.parent
-                    z.parent.children[self.get_child_key_fn(z.key)] = z
-                    x.parent = z
-                    z.last_access_time = x.last_access_time
-                    z._evict_count = x._evict_count + MAX_EVICT
-                    assert x.value is not None and x.host_value is not None
-                    assert self.cache_controller.evict_device(x.value, x.host_value) == MAX_EVICT
-                    num_evicted += MAX_EVICT
-                    self.evictable_size_ -= MAX_EVICT
-                    x.value = None
-                    self.tree_cpp.split_node(x.id, x.key, z.id, z.key)
-                    self.tree_cpp.evict_node(x.id)
-                    heapq.heappush(leaves, SortNode(z, rank_map))
+                num_evicted += MAX_EVICT
+                evicted[x] += MAX_EVICT
+                y.evict_max()
+                heapq.heappush(leaves, y)
+
+        for x, num_delete in evicted.items():
+            num_remain = len(x.key) - num_delete
+            assert x.value is not None and x.host_value is not None
+
+            # need to split the node, the remaining part is not evictable
+            z = TreeNode()
+            z.lock_ref = x.lock_ref
+            z.loading = x.loading
+            z.key, x.key = x.key[:num_remain], x.key[num_remain:]
+            z.value, x.value = x.value.split((num_remain, num_delete))
+            z.host_value, x.host_value = x.host_value.split((num_remain, num_delete))
+            z.children = {self.get_child_key_fn(x.key): x}
+            z.parent = x.parent
+            z.parent.children[self.get_child_key_fn(z.key)] = z
+            x.parent = z
+            z.last_access_time = x.last_access_time
+            z._evict_count = x._evict_count
+            assert x.value is not None and x.host_value is not None
+            assert self.cache_controller.evict_device(x.value, x.host_value) == num_delete
+            self.evictable_size_ -= num_delete
+            x.value = None
+            self.tree_cpp.split_node(x.id, x.key, z.id, z.key)
+            self.tree_cpp.evict_node(x.id)
 
     def evict(self, num_tokens: int):
         if self.evict_policy == "fair":
@@ -474,6 +474,7 @@ class HiRadixCache(RadixCache):
         new_node.key = child.key[:split_len]
         new_node.loading = child.loading
         new_node.hit_count = child.hit_count
+        new_node._evict_count = child._evict_count
 
         # split value and host value if exists
         if child.evicted:

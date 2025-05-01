@@ -104,7 +104,7 @@ def _key_match_paged(key0: List, key1: List, page_size: int):
     return i
 
 MAX_EVICT = 1024
-EVICT_THRESHOLD = 1024 + 128
+EVICT_THRESHOLD = MAX_EVICT + 128
 RATIO = 100
 
 class SortNode:
