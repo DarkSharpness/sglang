@@ -342,7 +342,7 @@ class HiRadixCache(RadixCache):
         while len(key) > 0 and child_key in node.children.keys():
             child = node.children[child_key]
             child.access()
-            prefix_len = self.key_match_fn(child.key, key)
+            prefix_len = _key_match_fn(child.key, key)
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
                 self.inc_hit_count(new_node)
@@ -396,7 +396,7 @@ class HiRadixCache(RadixCache):
         while len(key) > 0 and child_key in node.children.keys():
             node = node.children[child_key]
             node.access()
-            prefix_len = self.key_match_fn(node.key, key)
+            prefix_len = _key_match_fn(node.key, key)
 
             if prefix_len == len(node.key):
                 if node.evicted:
