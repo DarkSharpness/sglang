@@ -21,9 +21,7 @@ The radix tree data structure for managing the KV cache.
 
 import heapq
 import time
-from collections import defaultdict
-from functools import partial
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import torch
 
@@ -46,21 +44,29 @@ class TreeNode:
     counter = 0
 
     def __init__(self, id: Optional[int] = None):
-        self.children = defaultdict(TreeNode)
-        self.parent = None
-        self.key = None
-        self.value = None
-        self.lock_ref = 0
-        self.last_access_time = time.monotonic()
+        # each key/value's length must be aligned to page size
+        self.key: List[int] = []
+        self.value: torch.Tensor = []  # type: ignore
+        self.lock_ref: int = 0
+
+        self.children: Dict[Any, TreeNode] = {}
+        self.parent: TreeNode = None  # type: ignore
 
         self.hit_count = 0
         # indicating the node is loading KV cache from host
         self.loading = False
         # store the host indices of KV cache
-        self.host_value = None
+        self.host_value: Optional[torch.Tensor] = None
 
         self.id = TreeNode.counter if id is None else id
         TreeNode.counter += 1
+
+        # do no expose _last_access_time to the user
+        self.access()
+
+    def access(self):
+        """Update the last access time of the node."""
+        self._last_access_time = time.monotonic()
 
     @property
     def evicted(self):
@@ -71,27 +77,15 @@ class TreeNode:
         return self.host_value is not None
 
     def __lt__(self, other: "TreeNode"):
-        return self.last_access_time < other.last_access_time
+        return self._last_access_time < other._last_access_time
 
 
-def _key_match_page_size1(key0: List, key1: List):
+def _key_match_fn(key0: List[int], key1: List[int]) -> int:
     i = 0
     for k0, k1 in zip(key0, key1):
         if k0 != k1:
             break
         i += 1
-    return i
-
-
-def _key_match_paged(key0: List, key1: List, page_size: int):
-    min_len = min(len(key0), len(key1))
-
-    i = 0
-    while i < min_len:
-        if key0[i : i + page_size] != key1[i : i + page_size]:
-            break
-        i += page_size
-
     return i
 
 
@@ -117,10 +111,8 @@ class RadixCache(BasePrefixCache):
             self.device = torch.device("cpu")
 
         if self.page_size == 1:
-            self.key_match_fn = _key_match_page_size1
             self.get_child_key_fn = lambda key: key[0]
         else:
-            self.key_match_fn = partial(_key_match_paged, page_size=page_size)
             self.get_child_key_fn = lambda key: tuple(key[:page_size])
         self.reset()
 
@@ -129,13 +121,13 @@ class RadixCache(BasePrefixCache):
     def reset(self):
         self.root_node = TreeNode()
         self.root_node.key = []
-        self.root_node.value = []
+        self.root_node.value = []  # type: ignore
         self.root_node.lock_ref = 1
         self.evictable_size_ = 0
         self.protected_size_ = 0
         self._record_all_cleared_event()
 
-    def match_prefix(self, key: List[int], **kwargs) -> Tuple[torch.Tensor, int]:
+    def match_prefix(self, key: List[int], **kwargs) -> Tuple[torch.Tensor, TreeNode]:
         """Find the matching prefix from the radix tree.
         Args:
             key: A list of token IDs to find a matching prefix.
@@ -167,16 +159,21 @@ class RadixCache(BasePrefixCache):
             value = torch.empty((0,), dtype=torch.int64, device=self.device)
         return value, last_node
 
-    def insert(self, key: List, value=None):
+    def insert(self, key: List[int], value: torch.Tensor = None) -> int:  # type: ignore
         if self.disable:
             return 0
 
-        if value is None:
-            value = [x for x in key]
+        if value is None:  # only used for testing
+            value = torch.empty(
+                (len(key),),
+                dtype=torch.int64,
+                device=self.device,
+            )
         return self._insert_helper(self.root_node, key, value)
 
     def cache_finished_req(self, req: Req):
         """Cache request when it finishes."""
+        assert req.req_pool_idx is not None
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, : len(req.origin_input_ids) + len(req.output_ids) - 1
@@ -214,6 +211,8 @@ class RadixCache(BasePrefixCache):
         """Cache request when it is unfinished."""
         if self.disable:
             return
+
+        assert req.fill_ids is not None
 
         token_ids = req.fill_ids
         kv_indices = self.req_to_token_pool.req_to_token[
@@ -333,81 +332,125 @@ class RadixCache(BasePrefixCache):
 
     ##### Internal Helper Functions #####
 
-    def _match_prefix_helper(self, node: TreeNode, key: List):
-        node.last_access_time = time.monotonic()
+    def _tree_walk(
+        self, node: TreeNode, key: List[int]
+    ) -> Tuple[TreeNode, int, Optional[Tuple[TreeNode, int]]]:
+        """
+        Walk the radix tree to find the node that matches the key.
+        Nodes traversed will be accessed, but no other modifications will be made.
+        Args:
+            node: The current node to start the search.
+            key: The key to match.
+        Returns:
+            A tuple of the node that matches the key, the total prefix length matched,
+            and an optional tuple containing the child node and the prefix length matched.
+            If the key is fully matched, the child node will be None.
+            If a child node is partially matched, it will return the child node and the partial prefix length.
+        """
 
-        child_key = self.get_child_key_fn(key)
+        # always align the key to page size first
+        assert (
+            len(key) % self.page_size == 0
+        ), "Key length must be aligned to page size."
+        node.access()
+        total_prefix_length = 0
 
-        value = []
-        while len(key) > 0 and child_key in node.children.keys():
-            child = node.children[child_key]
-            child.last_access_time = time.monotonic()
-            prefix_len = self.key_match_fn(child.key, key)
+        while len(key) > 0 and (child := node.children.get(self.get_child_key_fn(key))):
+            child.access()
+            prefix_len = _key_match_fn(child.key, key)
+            # align the prefix length to page size
+            prefix_len = prefix_len // self.page_size * self.page_size
+            total_prefix_length += prefix_len
             if prefix_len < len(child.key):
-                new_node = self._split_node(child.key, child, prefix_len)
-                value.append(new_node.value)
-                node = new_node
-                break
-            else:
-                value.append(child.value)
-                node = child
-                key = key[prefix_len:]
+                return node, total_prefix_length, (child, prefix_len)
 
-                if len(key):
-                    child_key = self.get_child_key_fn(key)
+            key = key[prefix_len:]
+            node = child
 
-        return value, node
+        return node, total_prefix_length, None
 
-    def _split_node(self, key, child: TreeNode, split_len: int):
-        # new_node -> child
+    def _add_child(self, parent: TreeNode, child: TreeNode):
+        parent.children[self.get_child_key_fn(child.key)] = child
+        child.parent = parent
+
+    def _split_node(
+        self, parent: TreeNode, child: TreeNode, split_len: int
+    ) -> TreeNode:
+        assert (
+            split_len % self.page_size == 0
+        ), "Split length must be aligned to page size."
+        assert (
+            0 < split_len < len(child.key)
+        ), "Split length must be in the range (0, child.key length)."
+        assert (
+            len(child.key) % self.page_size == 0
+        ), "Child key length must be aligned to page size."
+
         self._record_remove_event(child)
+
+        # change the tree from "parent -> child" to "parent -> new_node -> child"
         new_node = TreeNode()
-        new_node.children = {self.get_child_key_fn(key[split_len:]): child}
-        new_node.parent = child.parent
-        new_node.lock_ref = child.lock_ref
-        new_node.key = child.key[:split_len]
-        new_node.value = child.value[:split_len]
-        child.parent = new_node
-        child.key = child.key[split_len:]
-        child.value = child.value[split_len:]
-        new_node.parent.children[self.get_child_key_fn(key)] = new_node
+        old_node = child
+
+        # key field
+        new_node.key = old_node.key[:split_len]
+        old_node.key = old_node.key[split_len:]
+        # value field
+        new_node.value, old_node.value = old_node.value.split_with_sizes(
+            (len(new_node.key), len(old_node.key))
+        )
+        # lock_ref field
+        new_node.lock_ref = old_node.lock_ref
+        # parent & children
+        self._add_child(new_node, old_node)
+        self._add_child(parent, new_node)
 
         self._record_store_event(new_node)
-        self._record_store_event(child)
+        self._record_store_event(old_node)
 
         return new_node
 
-    def _insert_helper(self, node: TreeNode, key: List, value):
-        node.last_access_time = time.monotonic()
-        if len(key) == 0:
-            return 0
+    def _match_prefix_helper(
+        self, node: TreeNode, key: List[int]
+    ) -> Tuple[List[torch.Tensor], TreeNode]:
+        page_aligned_length = len(key) // self.page_size * self.page_size
+        key = key[:page_aligned_length]
+        node, _, split_info = self._tree_walk(node, key)
 
-        child_key = self.get_child_key_fn(key)
+        if split_info is not None:
+            child, prefix_len = split_info
+            node = self._split_node(node, child, prefix_len)
 
-        total_prefix_length = 0
-        while len(key) > 0 and child_key in node.children.keys():
-            node = node.children[child_key]
-            node.last_access_time = time.monotonic()
-            prefix_len = self.key_match_fn(node.key, key)
-            total_prefix_length += prefix_len
-            key = key[prefix_len:]
-            value = value[prefix_len:]
+        # walk back to the root node and collect the values
+        result: List[torch.Tensor] = []
+        while node != self.root_node:
+            result.append(node.value)
+            node = node.parent
+        result.reverse()
+        return result, node
 
-            if prefix_len < len(node.key):
-                new_node = self._split_node(node.key, node, prefix_len)
-                node = new_node
+    def _insert_helper(self, node: TreeNode, key: List, value: torch.Tensor):
+        page_aligned_length = len(key) // self.page_size * self.page_size
+        node, total_prefix_length, split_info = self._tree_walk(
+            node, key[:page_aligned_length]
+        )
 
-            if len(key):
-                child_key = self.get_child_key_fn(key)
+        # fully matched, do nothing but return the prefix length
+        if total_prefix_length == page_aligned_length:
+            return total_prefix_length
 
-        if len(key):
-            new_node = TreeNode()
-            new_node.parent = node
-            new_node.key = key
-            new_node.value = value
-            node.children[child_key] = new_node
-            self.evictable_size_ += len(value)
-            self._record_store_event(new_node)
+        # not fully matched, and we need to split the node first
+        if split_info is not None:
+            child, prefix_len = split_info
+            node = self._split_node(node, child, prefix_len)
+
+        # now we should insert the rest into
+        new_node = TreeNode()
+        new_node.key = key[total_prefix_length:page_aligned_length]
+        new_node.value = value[total_prefix_length:page_aligned_length]
+        self._add_child(node, new_node)
+        self.evictable_size_ += len(new_node.key)
+        self._record_store_event(new_node)
         return total_prefix_length
 
     def _print_helper(self, node: TreeNode, indent: int):
@@ -428,11 +471,8 @@ class RadixCache(BasePrefixCache):
                     child.key
                 ), f"{key=}, {self.get_child_key_fn(child.key)=}"
 
-    def _delete_leaf(self, node):
-        for k, v in node.parent.children.items():
-            if v == node:
-                break
-        del node.parent.children[k]
+    def _delete_leaf(self, node: TreeNode):
+        del node.parent.children[self.get_child_key_fn(node.key)]
         self.evictable_size_ -= len(node.key)
 
     def _total_size_helper(self):
@@ -447,7 +487,7 @@ class RadixCache(BasePrefixCache):
                 stack.append(child)
         return total_size
 
-    def _collect_leaves(self):
+    def _collect_leaves(self) -> List[TreeNode]:
         ret_list = []
         stack = [self.root_node]
 
@@ -497,11 +537,11 @@ class RadixCache(BasePrefixCache):
 
 
 if __name__ == "__main__":
-    tree = RadixCache(None, None, page_size=1, disable=False)
+    tree = RadixCache(None, None, page_size=1, disable=False)  # type: ignore
 
-    tree.insert("Hello")
-    tree.insert("Hello")
-    tree.insert("Hello_L.A.!")
+    tree.insert("Hello")  # type: ignore
+    tree.insert("Hello")  # type: ignore
+    tree.insert("Hello_L.A.!")  # type: ignore
     # tree.insert("Hello_world! Happy")
     # tree.insert("I love you!")
     tree.pretty_print()

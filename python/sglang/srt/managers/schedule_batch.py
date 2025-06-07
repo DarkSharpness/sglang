@@ -38,7 +38,7 @@ import logging
 import threading
 from enum import Enum, auto
 from http import HTTPStatus
-from typing import TYPE_CHECKING, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Any, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import torch
@@ -430,7 +430,7 @@ class Req:
         self,
         rid: str,
         origin_input_text: str,
-        origin_input_ids: Tuple[int],
+        origin_input_ids: List[int],
         sampling_params: SamplingParams,
         return_logprob: bool = False,
         top_logprobs_num: int = 0,
@@ -508,12 +508,12 @@ class Req:
 
         # Prefix info
         # The indices to kv cache for the shared prefix.
-        self.prefix_indices = []
+        self.prefix_indices: torch.Tensor = []
         # Number of tokens to run prefill.
         self.extend_input_len = 0
         # The relative logprob_start_len in an extend batch
         self.extend_logprob_start_len = 0
-        self.last_node = None
+        self.last_node: Any = None
         self.last_node_global = None
 
         # Whether or not if it is chunked. It increments whenever
