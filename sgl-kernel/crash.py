@@ -12,7 +12,7 @@ def init_context(a: int):
     print(f"Available SM count: {cnt}")
     b = cnt - a
     device_id = torch.cuda.current_device()
-    stream_a, stream_b = cuda_utils.create_green_context(device_id, a, 1, 1)
+    stream_a, _, stream_b = cuda_utils.create_green_context(device_id, a, 1, 2, )
     device = torch.device(f"cuda:{device_id}")
     stream_a = torch.cuda.ExternalStream(stream_ptr=stream_a, device=device)
     stream_b = torch.cuda.ExternalStream(stream_ptr=stream_b, device=device)
@@ -52,14 +52,18 @@ class Context:
         self.k_host_cache = _make_host(self.k_cache)
         self.v_host_cache = _make_host(self.v_cache)
         self.page_table = torch.randint(
-            0, num_pages,
+            num_pages // 2 + 1, num_pages,
             (max_batch_size, max_seq_len),
             dtype=torch.int32,
             device=DEVICE,
             requires_grad=False
         )
-        self.tic = torch.cuda.Event(enable_timing=True)
-        self.toc = torch.cuda.Event(enable_timing=True)
+        self.indices = torch.arange(
+            0, (num_pages // 2),
+            dtype=torch.int64,
+            device=DEVICE,
+            requires_grad=False
+        )
         self.page_size = page_size
         self.head_dim = head_dim
         self.nhead_k = nhead_k
@@ -104,7 +108,6 @@ class Batch:
         )
 
 def run_batch(ctx: Context, batch: Batch, sm_margin: int = 0, layers: int = 32):
-    stream = torch.cuda.current_stream(DEVICE)
     assert batch.batch_size <= ctx.page_table.shape[0]
     assert batch.max_seqlen_k <= ctx.page_table.shape[1]
     page_table = ctx.page_table[:batch.batch_size, :batch.max_seqlen_k]
@@ -127,8 +130,7 @@ def run_copy(ctx: Context, batch: Batch):
     stream = torch.cuda.current_stream(DEVICE)
     assert batch.batch_size <= ctx.page_table.shape[0]
     assert batch.max_seqlen_k <= ctx.page_table.shape[1]
-    indices = ctx.page_table[:batch.batch_size, :batch.max_seqlen_k]
-    indices = indices.to(torch.int64).contiguous().view(-1)
+    indices = ctx.indices.contiguous().view(-1)
 
     transfer_kv_all_layer(
         src_k=ctx.k_cache,
@@ -138,7 +140,7 @@ def run_copy(ctx: Context, batch: Batch):
         src_indices=indices,
         dst_indices=indices.clone(),
         io_backend="kernel",
-        page_size=ctx.page_size,
+        page_size=1,
         src_layer_offset=math.prod(ctx.k_cache.shape[1:]),
         dst_layer_offset=math.prod(ctx.k_host_cache.shape[1:]),
         item_size=(ctx.head_dim * ctx.nhead_k),
@@ -147,28 +149,40 @@ def run_copy(ctx: Context, batch: Batch):
 
 
 def copy_thread(ctx: Context, batch: Batch, stream):
+    print("Copying KV cache to host...")
+    time.sleep(0.1)
+    tic = torch.cuda.Event(enable_timing=True)
+    toc = torch.cuda.Event(enable_timing=True)
     while True:
-        print("Copying KV cache to host...")
-        time.sleep(0.1)
         with torch.cuda.stream(stream):
+            tic.record(stream)
             run_copy(ctx, batch)
-            time.sleep(0.01)
-            print("Copy completed.")
+            toc.record(stream)
+            stream.synchronize()
+            elapsed = tic.elapsed_time(toc)
+            print(f"Copy time: {elapsed:.2f} ms")
+
 
 @lambda f: f()
-@torch.inference_mode()
+@torch.no_grad()
 def main():
-    stream_a, stream_b, sm_a, sm_b = init_context(32)
+    stream_a, stream_b, sm_a, sm_b = init_context(8)
     print(f"SM_a: {sm_a}, SM_b: {sm_b}")
-    ctx = Context(num_pages=8, page_size=1024, nhead_k=8, head_dim=128)
-    batch_decode = Batch(is_decode=True, seq_lens_k=[2049] * 16)
+    ctx = Context(num_pages=8192, page_size=8, nhead_k=8, head_dim=128)
+    batch_decode = Batch(is_decode=True, seq_lens_k=[2048] * 8)
 
-    threading.Thread(
-        target=copy_thread, args=(ctx, batch_decode, stream_b), daemon=True
-    ).start()
+    # threading.Thread(
+    #     target=copy_thread, args=(ctx, batch_decode, stream_a), daemon=True
+    # ).start()
 
+    print("Running batch decode...")
+    tic = torch.cuda.Event(enable_timing=True)
+    toc = torch.cuda.Event(enable_timing=True)
     while True:
-        print("Running batch decode...")
-        with torch.cuda.stream(stream_a):
-            run_batch(ctx, batch_decode, sm_margin=sm_b)
-            time.sleep(0.01)
+        with torch.cuda.stream(stream_b):
+            tic.record(stream_b)
+            run_batch(ctx, batch_decode, sm_margin=32)
+            toc.record(stream_b)
+            stream_b.synchronize()
+            elapsed = tic.elapsed_time(toc)
+            print(f"Batch decode time: {elapsed:.2f} ms")
