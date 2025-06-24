@@ -12,7 +12,7 @@ def init_context(a: int):
     print(f"Available SM count: {cnt}")
     b = cnt - a
     device_id = torch.cuda.current_device()
-    stream_a, _, stream_b = cuda_utils.create_green_context(device_id, a, 1, 2, )
+    stream_a, stream_b = cuda_utils.create_green_context(device_id, a, 1, 1)
     device = torch.device(f"cuda:{device_id}")
     stream_a = torch.cuda.ExternalStream(stream_ptr=stream_a, device=device)
     stream_b = torch.cuda.ExternalStream(stream_ptr=stream_b, device=device)
@@ -171,9 +171,9 @@ def main():
     ctx = Context(num_pages=8192, page_size=8, nhead_k=8, head_dim=128)
     batch_decode = Batch(is_decode=True, seq_lens_k=[2048] * 8)
 
-    # threading.Thread(
-    #     target=copy_thread, args=(ctx, batch_decode, stream_a), daemon=True
-    # ).start()
+    threading.Thread(
+        target=copy_thread, args=(ctx, batch_decode, stream_a), daemon=True
+    ).start()
 
     print("Running batch decode...")
     tic = torch.cuda.Event(enable_timing=True)
@@ -181,7 +181,7 @@ def main():
     while True:
         with torch.cuda.stream(stream_b):
             tic.record(stream_b)
-            run_batch(ctx, batch_decode, sm_margin=32)
+            run_batch(ctx, batch_decode, sm_margin=0)
             toc.record(stream_b)
             stream_b.synchronize()
             elapsed = tic.elapsed_time(toc)
