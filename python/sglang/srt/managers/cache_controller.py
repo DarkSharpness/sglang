@@ -28,6 +28,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+global_load_stream: torch.cuda.Stream = None # need to be initialized somewhere else
+global_write_stream: torch.cuda.Stream = None # need to be initialized somewhere else
 
 class LayerDoneCounter:
     def __init__(self, num_layers):
@@ -203,7 +205,19 @@ class HiCacheController:
         )
 
         self.write_stream = torch.cuda.Stream()
-        self.load_stream = torch.cuda.Stream()
+        self.load_stream = global_load_stream
+
+        if self.load_stream is None:
+            logger.info("Global load stream is not initialized, using default stream.")
+            self.load_stream = torch.cuda.Stream()
+        else:
+            logger.info("Using global load stream for loading KV caches.")
+
+        if self.write_stream is None:
+            logger.info("Global write stream is not initialized, using default stream.")
+            self.write_stream = torch.cuda.Stream()
+        else:
+            logger.info("Using global write stream for writing KV caches.")
 
         self.write_thread = threading.Thread(
             target=self.write_thread_func_direct, daemon=True

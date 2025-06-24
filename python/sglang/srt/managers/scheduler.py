@@ -2595,6 +2595,19 @@ def run_scheduler_process(
     dp_rank: Optional[int],
     pipe_writer,
 ):
+    from sgl_kernel import cuda_utils # type: ignore
+    device_id = torch.cuda.current_device()
+    result: List[int] = cuda_utils.create_green_context(device_id, 16, 2, 1)
+    assert len(result) == 3
+    device = torch.device(f"cuda:{device_id}")
+    stream_global = torch.cuda.ExternalStream(stream_ptr=result[-1], device=device)
+    stream_a = torch.cuda.ExternalStream(stream_ptr=result[0], device=device)
+    stream_b = torch.cuda.ExternalStream(stream_ptr=result[1], device=device)
+    import sglang.srt.managers.cache_controller as controller
+    controller.global_load_stream = stream_a
+    controller.global_write_stream = stream_b
+    torch.cuda.set_stream(stream_global) # type: ignore
+
     # Generate the prefix
     prefix = ""
     if dp_rank is not None:
