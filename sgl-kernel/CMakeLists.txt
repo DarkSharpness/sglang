@@ -398,3 +398,18 @@ install(DIRECTORY "${repo-cutlass_SOURCE_DIR}/include/cute/"
 
 install(DIRECTORY "${repo-cutlass_SOURCE_DIR}/include/cutlass/"
         DESTINATION "deep_gemm/include/cutlass")
+
+set(RADIX_SOURCES
+    "csrc/misc.cu"
+)
+Python_add_library(cuda_utils MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${RADIX_SOURCES})
+set(RADIX_TREE_CPP_FLAGS
+    "-O3"
+    "-fPIC"
+    "-Wall"
+    "-Wextra"
+)
+target_compile_options(cuda_utils PRIVATE ${RADIX_TREE_CPP_FLAGS})
+find_library(TORCH_PYTHON_LIBRARY torch_python PATH "${TORCH_INSTALL_PREFIX}/lib")
+target_link_libraries(cuda_utils PRIVATE ${TORCH_LIBRARIES} ${TORCH_PYTHON_LIBRARY} cuda)
+install(TARGETS cuda_utils LIBRARY DESTINATION sgl_kernel)
