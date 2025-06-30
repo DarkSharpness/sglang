@@ -45,6 +45,7 @@ from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
 from sglang.srt.managers.io_struct import (
     EmbeddingReqInput,
     GenerateReqInput,
+    GetAllSerializedParametersReqInput,
     GetWeightsByNameReqInput,
     ImageDataItem,
     InitWeightsUpdateGroupReqInput,
@@ -478,6 +479,14 @@ class Engine(EngineBase):
         loop = asyncio.get_event_loop()
         return loop.run_until_complete(
             self.tokenizer_manager.get_weights_by_name(obj, None)
+        )
+
+    def get_all_serialized_parameters(self):
+        """Get all serialized parameters from the model."""
+        obj = GetAllSerializedParametersReqInput()
+        loop = asyncio.get_event_loop()
+        return loop.run_until_complete(
+            self.tokenizer_manager.get_all_serialized_parameters(obj, None)
         )
 
     def load_lora_adapter(self, lora_name: str, lora_path: str):

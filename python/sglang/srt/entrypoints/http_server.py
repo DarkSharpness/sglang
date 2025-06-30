@@ -70,6 +70,7 @@ from sglang.srt.managers.io_struct import (
     ConfigureLoggingReq,
     EmbeddingReqInput,
     GenerateReqInput,
+    GetAllSerializedParametersReqInput,
     GetWeightsByNameReqInput,
     InitWeightsUpdateGroupReqInput,
     LoadLoRAAdapterReqInput,
@@ -552,6 +553,23 @@ async def get_weights_by_name(obj: GetWeightsByNameReqInput, request: Request):
         ret = await _global_state.tokenizer_manager.get_weights_by_name(obj, request)
         if ret is None:
             return _create_error_response("Get parameter by name failed")
+        else:
+            return ORJSONResponse(ret, status_code=200)
+    except Exception as e:
+        return _create_error_response(e)
+
+
+@app.api_route("/get_all_serialized_parameters", methods=["GET", "POST"])
+async def get_all_serialized_parameters(
+    obj: GetAllSerializedParametersReqInput, request: Request
+):
+    """Get all serialized parameters from the model."""
+    try:
+        ret = await _global_state.tokenizer_manager.get_all_serialized_parameters(
+            obj, request
+        )
+        if ret is None:
+            return _create_error_response("Get all serialized parameters failed")
         else:
             return ORJSONResponse(ret, status_code=200)
     except Exception as e:

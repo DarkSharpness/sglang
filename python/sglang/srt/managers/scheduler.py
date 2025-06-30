@@ -73,6 +73,7 @@ from sglang.srt.managers.io_struct import (
     ExpertDistributionReqOutput,
     FlushCacheReqInput,
     FlushCacheReqOutput,
+    GetAllSerializedParametersReqInput,
     GetInternalStateReq,
     GetInternalStateReqOutput,
     GetWeightsByNameReqInput,
@@ -511,6 +512,10 @@ class Scheduler(
                 (ExpertDistributionReq, self.expert_distribution_handle),
                 (LoadLoRAAdapterReqInput, self.load_lora_adapter),
                 (UnloadLoRAAdapterReqInput, self.unload_lora_adapter),
+                (
+                    GetAllSerializedParametersReqInput,
+                    self.get_all_serialized_parameters,
+                ),
             ]
         )
 
@@ -2325,6 +2330,13 @@ class Scheduler(
     def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):
         parameter = self.tp_worker.get_weights_by_name(recv_req)
         return GetWeightsByNameReqOutput(parameter)
+
+    def get_all_serialized_parameters(
+        self, recv_req: GetAllSerializedParametersReqInput
+    ):
+        """Get all serialized parameters from the model."""
+        result = self.tp_worker.get_all_serialized_parameters(recv_req)
+        return result
 
     def release_memory_occupation(self, recv_req: ReleaseMemoryOccupationReqInput):
         tags = recv_req.tags

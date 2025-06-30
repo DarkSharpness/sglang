@@ -67,6 +67,7 @@ from sglang.srt.layers.sampler import Sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.layers.utils import is_sm100_supported
 from sglang.srt.lora.lora_manager import LoRAManager
+from sglang.srt.managers.io_struct import GetAllSerializedParametersReqOutput
 from sglang.srt.managers.schedule_batch import (
     GLOBAL_SERVER_ARGS_KEYS,
     global_server_args_dict,
@@ -807,6 +808,44 @@ class ModelRunner:
         except Exception as e:
             logger.error(f"Error when getting parameter {name}: {e}")
             return None
+
+    def get_all_serialized_parameters(self) -> GetAllSerializedParametersReqOutput:
+        """Get all serialized parameters from the model.
+
+        Returns:
+            GetAllSerializedParametersReqOutput containing serialized parameters and model config.
+        """
+        try:
+            serialized_parameters = {}
+            for name, param in self.model.named_parameters(remove_duplicate=False):
+                data = MultiprocessingSerializer.serialize(param)
+                serialized_parameters[name] = [data]
+
+            # Get model configuration
+            model_config = {}
+            if hasattr(self.model, "config"):
+                # Extract relevant config information
+                config = self.model.config
+                model_config = {
+                    "model_type": getattr(config, "model_type", "unknown"),
+                    "architectures": getattr(config, "architectures", []),
+                    "hidden_size": getattr(config, "hidden_size", None),
+                    "num_hidden_layers": getattr(config, "num_hidden_layers", None),
+                    "num_attention_heads": getattr(config, "num_attention_heads", None),
+                    "vocab_size": getattr(config, "vocab_size", None),
+                    "intermediate_size": getattr(config, "intermediate_size", None),
+                }
+
+            return GetAllSerializedParametersReqOutput(
+                serialized_parameters=serialized_parameters,
+                model_config=model_config,
+                success=True,
+            )
+        except Exception as e:
+            logger.error(f"Error when getting all serialized parameters: {e}")
+            return GetAllSerializedParametersReqOutput(
+                serialized_parameters={}, model_config={}, success=False, message=str(e)
+            )
 
     def init_lora_manager(self):
         self.lora_manager = LoRAManager(

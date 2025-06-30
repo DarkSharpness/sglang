@@ -818,6 +818,27 @@ class GetWeightsByNameReqOutput:
 
 
 @dataclass
+class GetAllSerializedParametersReqInput:
+    """Request to get all serialized parameters from the model."""
+
+    pass
+
+
+@dataclass
+class GetAllSerializedParametersReqOutput:
+    """Response containing all serialized parameters from the model."""
+
+    # Dictionary mapping parameter names to LocalSerializedTensor
+    serialized_parameters: Dict[str, List[bytes]]
+    # Model configuration information
+    model_config: Dict[str, Any]
+    # Success status
+    success: bool
+    # Error message if any
+    message: str = ""
+
+
+@dataclass
 class ReleaseMemoryOccupationReqInput:
     # Optional tags to identify the memory region, which is primarily used for RL
     # Currently we only support `weights` and `kv_cache`

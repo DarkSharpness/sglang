@@ -28,6 +28,7 @@ from sglang.srt.hf_transformers_utils import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.io_struct import (
+    GetAllSerializedParametersReqInput,
     GetWeightsByNameReqInput,
     InitWeightsUpdateGroupReqInput,
     LoadLoRAAdapterReqInput,
@@ -277,6 +278,13 @@ class TpModelWorker:
             recv_req.name, recv_req.truncate_size
         )
         return parameter
+
+    def get_all_serialized_parameters(
+        self, recv_req: GetAllSerializedParametersReqInput
+    ):
+        """Get all serialized parameters from the model."""
+        result = self.model_runner.get_all_serialized_parameters()
+        return result
 
     def load_lora_adapter(self, recv_req: LoadLoRAAdapterReqInput):
         result = self.model_runner.load_lora_adapter(

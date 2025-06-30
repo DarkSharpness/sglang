@@ -70,3 +70,11 @@ class EngineBase(ABC):
     def shutdown(self):
         """Shutdown the engine and clean up resources."""
         pass
+
+    def get_all_serialized_parameters(self):
+        """Get all serialized parameters from the model.
+
+        Returns:
+            Dict containing serialized parameters and model configuration.
+        """
+        pass

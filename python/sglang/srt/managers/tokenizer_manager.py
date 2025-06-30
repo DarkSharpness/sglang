@@ -76,6 +76,7 @@ from sglang.srt.managers.io_struct import (
     FlushCacheReqInput,
     FlushCacheReqOutput,
     GenerateReqInput,
+    GetAllSerializedParametersReqInput,
     GetInternalStateReq,
     GetInternalStateReqOutput,
     GetWeightsByNameReqInput,
@@ -333,6 +334,9 @@ class TokenizerManager:
             self.send_to_scheduler, server_args.dp_size
         )
         self.update_lora_adapter_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
+        self.get_all_serialized_parameters_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
 
@@ -1016,6 +1020,19 @@ class TokenizerManager:
             return all_parameters[0]
         else:
             return all_parameters
+
+    async def get_all_serialized_parameters(
+        self,
+        obj: GetAllSerializedParametersReqInput,
+        request: Optional[fastapi.Request] = None,
+    ):
+        """Get all serialized parameters from the model."""
+        self.auto_create_handle_loop()
+        results = await self.get_all_serialized_parameters_communicator(obj)
+        if self.server_args.dp_size == 1:
+            return results[0]
+        else:
+            return results
 
     async def release_memory_occupation(
         self,
