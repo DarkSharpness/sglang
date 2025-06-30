@@ -283,8 +283,7 @@ class TpModelWorker:
         self, recv_req: GetAllSerializedParametersReqInput
     ):
         """Get all serialized parameters from the model."""
-        result = self.model_runner.get_all_serialized_parameters()
-        return result
+        return self.model_runner.get_all_serialized_parameters()
 
     def load_lora_adapter(self, recv_req: LoadLoRAAdapterReqInput):
         result = self.model_runner.load_lora_adapter(

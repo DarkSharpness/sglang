@@ -24,6 +24,7 @@ import psutil
 import torch
 
 from sglang.srt.managers.io_struct import (
+    GetAllSerializedParametersReqInput,
     GetWeightsByNameReqInput,
     InitWeightsUpdateGroupReqInput,
     LoadLoRAAdapterReqInput,
@@ -279,3 +280,9 @@ class TpModelWorkerClient:
     def __delete__(self):
         self.input_queue.put((None, None))
         self.copy_queue.put((None, None, None))
+
+    def get_all_serialized_parameters(
+        self, recv_req: GetAllSerializedParametersReqInput
+    ):
+        """Get all serialized parameters from the model."""
+        return self.worker.get_all_serialized_parameters(recv_req)

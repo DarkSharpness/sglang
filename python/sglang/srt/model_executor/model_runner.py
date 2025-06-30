@@ -818,34 +818,16 @@ class ModelRunner:
         try:
             serialized_parameters = {}
             for name, param in self.model.named_parameters(remove_duplicate=False):
-                data = MultiprocessingSerializer.serialize(param)
-                serialized_parameters[name] = [data]
-
-            # Get model configuration
-            model_config = {}
-            # if hasattr(self.model, "config"):
-            #     # Extract relevant config information
-            #     config = self.model.config
-            #     model_config = {
-            #         "model_type": getattr(config, "model_type", "unknown"),
-            #         "architectures": getattr(config, "architectures", []),
-            #         "hidden_size": getattr(config, "hidden_size", None),
-            #         "num_hidden_layers": getattr(config, "num_hidden_layers", None),
-            #         "num_attention_heads": getattr(config, "num_attention_heads", None),
-            #         "vocab_size": getattr(config, "vocab_size", None),
-            #         "intermediate_size": getattr(config, "intermediate_size", None),
-            #     }
+                serialized_parameters[name] = MultiprocessingSerializer.serialize(param)
 
             return GetAllSerializedParametersReqOutput(
-                serialized_parameters=serialized_parameters,
-                model_config=model_config,
-                tp_rank=self.tp_rank,
+                serialized_parameters=[serialized_parameters],
                 success=True,
             )
         except Exception as e:
             logger.error(f"Error when getting all serialized parameters: {e}")
             return GetAllSerializedParametersReqOutput(
-                serialized_parameters={}, model_config={}, tp_rank=self.tp_rank, success=False, message=str(e)
+                serialized_parameters=[], success=False, message=str(e)
             )
 
     def init_lora_manager(self):

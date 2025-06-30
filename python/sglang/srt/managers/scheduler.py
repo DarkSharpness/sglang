@@ -31,7 +31,7 @@ import psutil
 import setproctitle
 import torch
 import zmq
-from torch.distributed import barrier
+from torch.distributed import barrier, gather_object
 
 from sglang.global_config import global_config
 from sglang.srt.configs.model_config import ModelConfig
@@ -2336,6 +2336,20 @@ class Scheduler(
     ):
         """Get all serialized parameters from the model."""
         result = self.tp_worker.get_all_serialized_parameters(recv_req)
+        if result.success:
+            # need to collect all the data on TP = 0
+            assert len(result.serialized_parameters) == 1
+            gather_list: List | None = [None] * self.tp_size if self.tp_rank == 0 else None
+            gather_object(
+                result.serialized_parameters[0],
+                gather_list,
+                group=self.tp_cpu_group,
+                group_dst=0,
+            )
+            if gather_list is not None:
+                assert self.tp_rank == 0
+                assert all(isinstance(x, dict) for x in gather_list)
+                result.serialized_parameters = gather_list
         return result
 
     def release_memory_occupation(self, recv_req: ReleaseMemoryOccupationReqInput):

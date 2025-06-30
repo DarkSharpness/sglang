@@ -829,11 +829,8 @@ class GetAllSerializedParametersReqOutput:
     """Response containing all serialized parameters from the model."""
 
     # Dictionary mapping parameter names to LocalSerializedTensor
-    serialized_parameters: Dict[str, List[bytes]]
-    # Model configuration information
-    model_config: Dict[str, Any]
-    # TP rank of this output
-    tp_rank: int
+    # The i-th element is the i-th TP-rank's serialized parameters.
+    serialized_parameters: List[Dict[str, bytes]]
     # Success status
     success: bool
     # Error message if any

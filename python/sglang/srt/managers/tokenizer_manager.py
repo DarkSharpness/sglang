@@ -411,6 +411,7 @@ class TokenizerManager:
                     self.update_lora_adapter_communicator.handle_recv,
                 ),
                 (HealthCheckOutput, lambda x: None),
+                (GetAllSerializedParametersReqOutput, self.get_all_serialized_parameters_communicator.handle_recv),
             ]
         )
 
