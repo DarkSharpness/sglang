@@ -77,6 +77,7 @@ from sglang.srt.managers.io_struct import (
     FlushCacheReqOutput,
     GenerateReqInput,
     GetAllSerializedParametersReqInput,
+    GetAllSerializedParametersReqOutput,
     GetInternalStateReq,
     GetInternalStateReqOutput,
     GetWeightsByNameReqInput,
@@ -1028,11 +1029,10 @@ class TokenizerManager:
     ):
         """Get all serialized parameters from the model."""
         self.auto_create_handle_loop()
-        results = await self.get_all_serialized_parameters_communicator(obj)
-        if self.server_args.dp_size == 1:
-            return results[0]
-        else:
-            return results
+        results: List[GetAllSerializedParametersReqOutput] = (
+            await self.get_all_serialized_parameters_communicator(obj)
+        )
+        return results
 
     async def release_memory_occupation(
         self,

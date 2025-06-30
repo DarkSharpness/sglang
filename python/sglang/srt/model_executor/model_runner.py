@@ -823,28 +823,29 @@ class ModelRunner:
 
             # Get model configuration
             model_config = {}
-            if hasattr(self.model, "config"):
-                # Extract relevant config information
-                config = self.model.config
-                model_config = {
-                    "model_type": getattr(config, "model_type", "unknown"),
-                    "architectures": getattr(config, "architectures", []),
-                    "hidden_size": getattr(config, "hidden_size", None),
-                    "num_hidden_layers": getattr(config, "num_hidden_layers", None),
-                    "num_attention_heads": getattr(config, "num_attention_heads", None),
-                    "vocab_size": getattr(config, "vocab_size", None),
-                    "intermediate_size": getattr(config, "intermediate_size", None),
-                }
+            # if hasattr(self.model, "config"):
+            #     # Extract relevant config information
+            #     config = self.model.config
+            #     model_config = {
+            #         "model_type": getattr(config, "model_type", "unknown"),
+            #         "architectures": getattr(config, "architectures", []),
+            #         "hidden_size": getattr(config, "hidden_size", None),
+            #         "num_hidden_layers": getattr(config, "num_hidden_layers", None),
+            #         "num_attention_heads": getattr(config, "num_attention_heads", None),
+            #         "vocab_size": getattr(config, "vocab_size", None),
+            #         "intermediate_size": getattr(config, "intermediate_size", None),
+            #     }
 
             return GetAllSerializedParametersReqOutput(
                 serialized_parameters=serialized_parameters,
                 model_config=model_config,
+                tp_rank=self.tp_rank,
                 success=True,
             )
         except Exception as e:
             logger.error(f"Error when getting all serialized parameters: {e}")
             return GetAllSerializedParametersReqOutput(
-                serialized_parameters={}, model_config={}, success=False, message=str(e)
+                serialized_parameters={}, model_config={}, tp_rank=self.tp_rank, success=False, message=str(e)
             )
 
     def init_lora_manager(self):

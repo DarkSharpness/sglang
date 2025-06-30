@@ -832,6 +832,8 @@ class GetAllSerializedParametersReqOutput:
     serialized_parameters: Dict[str, List[bytes]]
     # Model configuration information
     model_config: Dict[str, Any]
+    # TP rank of this output
+    tp_rank: int
     # Success status
     success: bool
     # Error message if any
