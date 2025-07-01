@@ -1,14 +1,20 @@
-#include <ATen/cuda/CUDAContextLight.h>
-
-#include <cstddef>
 #undef Py_LIMITED_API
+#include <ATen/cuda/CUDAContextLight.h>
+#include <ATen/ops/from_blob.h>
+#include <c10/cuda/CUDACachingAllocator.h>
+#include <c10/cuda/CUDAException.h>
 #include <cuda_runtime.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <torch/extension.h>
 
+#include <array>
+#include <cstddef>
 #include <cstdint>
+#include <iostream>
+#include <string>
 #include <tuple>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -130,11 +136,104 @@ auto set_cublas_sm(std::size_t sm_target) -> void {
   cublasSetSmCountTarget(handle, sm_target);
 }
 
+struct MetaData {
+  cudaIpcMemHandle_t handle;
+  std::array<int, 4> shape;
+  std::array<int, 4> stride;
+  c10::Device device;
+  c10::Layout layout;
+  c10::ScalarType dtype;
+  int dim;
+  int64_t offset;
+};
+
+auto share_ipc_tensor(torch::Tensor tensor) -> MetaData {
+  auto [offset, str] = at::cuda::CUDACachingAllocator::shareIpcHandle(tensor.storage().mutable_data());
+  std::cerr << (int)str[0] << " " << (int)str[1] << " " << str.size() << std::endl;
+  if (str[1] != 'c') {
+    throw std::runtime_error("Invalid IPC handle string format: expected 'c' at position 1.");
+  }
+  if (str.size() != 2 + sizeof(cudaIpcMemHandle_t)) {
+    std::cerr << "Invalid IPC handle string size: " << str.size() << std::endl;
+    throw std::runtime_error("Invalid IPC handle string format.");
+  }
+
+  auto result = MetaData{
+      .device = tensor.device(),
+      .layout = tensor.layout(),
+      .dtype = tensor.scalar_type(),
+  };
+
+  std::memcpy(&result.handle, str.data() + 2, sizeof(cudaIpcMemHandle_t));
+  auto shape = tensor.sizes().vec();
+  auto stride = tensor.strides().vec();
+  if (shape.size() >= 4 || stride.size() >= 4) {
+    throw std::runtime_error("Tensor shape or stride exceeds 4 dimensions.");
+  }
+
+  std::copy(shape.begin(), shape.end(), result.shape.begin());
+  std::copy(stride.begin(), stride.end(), result.stride.begin());
+  result.dim = static_cast<int>(tensor.dim());
+  result.offset = offset;
+  return result;
+}
+
+struct CompareEQ {
+  bool operator()(const cudaIpcMemHandle_t& lhs, const cudaIpcMemHandle_t& rhs) const {
+    return std::memcmp(&lhs, &rhs, sizeof(cudaIpcMemHandle_t)) == 0;
+  }
+};
+
+struct HashIpcHandle {
+  std::size_t operator()(const cudaIpcMemHandle_t& handle) const {
+    std::size_t hash = 0;
+    for (auto c : handle.reserved) {
+      hash = (hash * 31) ^ static_cast<std::size_t>(c);
+    }
+    return hash;
+  }
+};
+
+std::unordered_map<cudaIpcMemHandle_t, void*, HashIpcHandle, CompareEQ> ipc_tensor_cache;
+
+auto open_ipc_tensor(const MetaData& meta) -> torch::Tensor {
+  void* ptr = nullptr;
+  if (auto& ref = ipc_tensor_cache[meta.handle]) {
+    ptr = ref;
+  } else {
+    std::cerr << "Opening IPC handle: \n";
+    C10_CUDA_CHECK(cudaIpcOpenMemHandle(&ptr, meta.handle, cudaIpcMemLazyEnablePeerAccess));
+    ref = ptr;  // Cache the pointer for future use
+  }
+  auto options = torch::TensorOptions().device(meta.device).layout(meta.layout).dtype(meta.dtype).requires_grad(false);
+  auto shape = std::vector<int64_t>(meta.shape.begin(), meta.shape.begin() + meta.dim);
+  auto stride = std::vector<int64_t>(meta.stride.begin(), meta.stride.begin() + meta.dim);
+  ptr = static_cast<char*>(ptr) + meta.offset;
+  auto tensor = at::from_blob(ptr, shape, stride, options);
+  tensor.set_requires_grad(false);
+  return tensor;
+}
+
+auto share_ipc_bytes(torch::Tensor tensor) -> pybind11::bytes {
+  auto meta = share_ipc_tensor(tensor);
+  char buffer[sizeof(MetaData) + 1] = {0};
+  std::memcpy(buffer, &meta, sizeof(MetaData));
+  return pybind11::bytes(buffer, sizeof(MetaData));
+}
+
+auto open_ipc_bytes(std::string buffer) -> torch::Tensor {
+  auto meta = MetaData{.device = c10::kCPU, .layout = c10::kStrided, .dtype = c10::kFloat};
+  std::memcpy(&meta, buffer.data(), sizeof(MetaData));
+  return open_ipc_tensor(meta);
+}
+
 PYBIND11_MODULE(cuda_utils, m) {
   m.attr("__name__") = "sgl_kernel.cuda_utils";
   m.def("get_sm_count", &get_sm_count);
   m.def("split_by_count", &split_by_count);
   m.def("set_cublas_sm", &set_cublas_sm);
+  m.def("share_ipc_tensor", &share_ipc_bytes);
+  m.def("open_ipc_tensor", &open_ipc_bytes);
 }
 
 }  // namespace

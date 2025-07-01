@@ -824,6 +824,10 @@ class Llama3RotaryEmbedding(RotaryEmbedding):
                 (1 - smooth) * inv_freqs / self.scaling_factor + smooth * inv_freqs,
             ),
         )
+
+        smooth = torch.clamp(smooth, 0, 1)
+        tmp = (1 - smooth) / self.scaling_factor + smooth
+        assert torch.allclose(tmp * inv_freqs, new_freqs, atol=1e-5)
         return new_freqs
 
 

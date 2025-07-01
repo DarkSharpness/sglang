@@ -815,10 +815,12 @@ class ModelRunner:
         Returns:
             GetAllSerializedParametersReqOutput containing serialized parameters and model config.
         """
+        from sgl_kernel import cuda_utils # type: ignore
+
         try:
             serialized_parameters = {}
             for name, param in self.model.named_parameters(remove_duplicate=False):
-                serialized_parameters[name] = MultiprocessingSerializer.serialize(param)
+                serialized_parameters[name] = cuda_utils.share_ipc_tensor(param)
 
             return GetAllSerializedParametersReqOutput(
                 serialized_parameters=[serialized_parameters],
