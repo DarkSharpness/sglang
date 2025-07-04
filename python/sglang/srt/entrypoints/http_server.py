@@ -568,6 +568,10 @@ async def get_all_serialized_parameters(
         ret = await _global_state.tokenizer_manager.get_all_serialized_parameters(
             obj, request
         )
+        with open("/tmp/serialized_parameters.pkl", "wb") as f:
+            import pickle
+            pickle.dump(ret, f)
+        ret = "/tmp/serialized_parameters.pkl"
         if ret is None:
             return _create_error_response("Get all serialized parameters failed")
         else:
