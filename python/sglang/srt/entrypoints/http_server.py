@@ -558,6 +558,7 @@ async def get_weights_by_name(obj: GetWeightsByNameReqInput, request: Request):
     except Exception as e:
         return _create_error_response(e)
 
+PATH_NUM=0
 
 @app.api_route("/get_all_serialized_parameters", methods=["GET", "POST"])
 async def get_all_serialized_parameters(
@@ -568,10 +569,13 @@ async def get_all_serialized_parameters(
         ret = await _global_state.tokenizer_manager.get_all_serialized_parameters(
             obj, request
         )
-        with open("/tmp/serialized_parameters.pkl", "wb") as f:
+        global PATH_NUM
+        PATH_NUM += 1
+        path = f"/tmp/serialized_parameters_{PATH_NUM}.pkl"
+        with open(path, "wb") as f:
             import pickle
             pickle.dump(ret, f)
-        ret = "/tmp/serialized_parameters.pkl"
+        ret = path
         if ret is None:
             return _create_error_response("Get all serialized parameters failed")
         else:
