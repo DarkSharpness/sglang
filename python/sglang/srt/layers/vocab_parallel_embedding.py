@@ -33,7 +33,7 @@ from sglang.srt.utils import (
     set_weight_attrs,
 )
 
-DEFAULT_VOCAB_PADDING_SIZE = 64
+DEFAULT_VOCAB_PADDING_SIZE = 56
 
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()

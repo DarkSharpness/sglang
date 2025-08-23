@@ -291,6 +291,8 @@ class ColumnParallelLinear(LinearBase):
         tp_rank: Optional[int] = None,
         tp_size: Optional[int] = None,
         use_presharded_weights: bool = False,
+        num_heads: Optional[int] = None,
+        num_kv_heads: Optional[int] = None,
     ):
         super().__init__(
             input_size, output_size, skip_bias_add, params_dtype, quant_config, prefix
@@ -784,6 +786,8 @@ class QKVParallelLinear(ColumnParallelLinear):
         tp_rank: Optional[int] = None,
         tp_size: Optional[int] = None,
         load_presharded_attn: bool = False,
+        num_heads: Optional[int] = None,
+        num_kv_heads: Optional[int] = None,
     ):
         self.hidden_size = hidden_size
         self.head_size = head_size
@@ -797,13 +801,19 @@ class QKVParallelLinear(ColumnParallelLinear):
         if tp_size is None:
             tp_size = get_tensor_model_parallel_world_size()
         self.tp_rank, self.tp_size = tp_rank, tp_size
-        self.num_heads = divide(self.total_num_heads, tp_size)
-        if tp_size >= self.total_num_kv_heads:
-            self.num_kv_heads = 1
-            self.num_kv_head_replicas = divide(tp_size, self.total_num_kv_heads)
+        if num_heads is None or num_kv_heads is None:
+            self.num_heads = divide(self.total_num_heads, tp_size)
+            if tp_size >= self.total_num_kv_heads:
+                self.num_kv_heads = 1
+                self.num_kv_head_replicas = divide(tp_size, self.total_num_kv_heads)
+            else:
+                self.num_kv_heads = divide(self.total_num_kv_heads, tp_size)
+                self.num_kv_head_replicas = 1
         else:
-            self.num_kv_heads = divide(self.total_num_kv_heads, tp_size)
+            self.num_heads = num_heads
+            self.num_kv_heads = num_kv_heads
             self.num_kv_head_replicas = 1
+
         self.q_proj_shard_size = self.num_heads * self.head_size
         self.kv_proj_shard_size = self.num_kv_heads * self.head_size
         input_size = self.hidden_size
@@ -1184,6 +1194,8 @@ class RowParallelLinear(LinearBase):
         tp_rank: Optional[int] = None,
         tp_size: Optional[int] = None,
         use_presharded_weights: bool = False,
+        num_kv_heads: Optional[int] = None,
+        total_num_kv_heads: Optional[int] = None,
     ):
         super().__init__(
             input_size, output_size, skip_bias_add, params_dtype, quant_config, prefix
@@ -1198,7 +1210,11 @@ class RowParallelLinear(LinearBase):
         if tp_size is None:
             tp_size = get_tensor_model_parallel_world_size()
         self.tp_rank, self.tp_size = tp_rank, tp_size
-        self.input_size_per_partition = divide(input_size, self.tp_size)
+        if total_num_kv_heads is None or num_kv_heads is None:
+            self.input_size_per_partition = divide(input_size, self.tp_size)
+        else:
+            self.input_size_per_partition = divide(input_size, total_num_kv_heads) * num_kv_heads
+
         assert self.quant_method is not None
         self.use_presharded_weights = use_presharded_weights
 

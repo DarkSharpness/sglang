@@ -13,6 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+from sglang.misc.utils import divide_uneven_by_head
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 """
@@ -166,7 +167,7 @@ class MHATokenToKVPool(KVCache):
         size: int,
         page_size: int,
         dtype: torch.dtype,
-        head_num: int,
+        total_head_num: int,
         head_dim: int,
         layer_num: int,
         device: str,
@@ -184,8 +185,13 @@ class MHATokenToKVPool(KVCache):
             start_layer,
             end_layer,
         )
-        self.head_num = head_num
+
         self.head_dim = head_dim
+
+        self.head_num_per_layer = [
+            divide_uneven_by_head(total_head_num, total_head_num, i)
+            for i in range(layer_num)
+        ]
 
         # for disagg with nvlink
         self.enable_custom_mem_pool = get_bool_env_var(
@@ -223,19 +229,27 @@ class MHATokenToKVPool(KVCache):
                 # The padded slot 0 is used for writing dummy outputs from padded tokens.
                 self.k_buffer = [
                     torch.zeros(
-                        (self.size + self.page_size, self.head_num, self.head_dim),
+                        (
+                            self.size + self.page_size,
+                            self.head_num_per_layer[i],
+                            self.head_dim,
+                        ),
                         dtype=self.store_dtype,
                         device=self.device,
                     )
-                    for _ in range(self.layer_num)
+                    for i in range(self.layer_num)
                 ]
                 self.v_buffer = [
                     torch.zeros(
-                        (self.size + self.page_size, self.head_num, self.head_dim),
+                        (
+                            self.size + self.page_size,
+                            self.head_num_per_layer[i],
+                            self.head_dim,
+                        ),
                         dtype=self.store_dtype,
                         device=self.device,
                     )
-                    for _ in range(self.layer_num)
+                    for i in range(self.layer_num)
                 ]
 
         self.k_data_ptrs = torch.tensor(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 from typing import TYPE_CHECKING, Optional, Union
 
 import numpy as np
@@ -1032,6 +1033,8 @@ class FlashAttentionBackend(AttentionBackend):
                 q_reshaped = q.contiguous().view(
                     -1, layer.tp_q_head_num, layer.head_dim
                 )
+                # logger = logging.getLogger(__name__)
+                # logger.info(f"{layer.tp_q_head_num = } {layer.head_dim = } {layer.layer_id = }")
 
                 # Default: single-token self-attention
                 result = flash_attn_with_kvcache(

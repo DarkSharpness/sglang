@@ -1351,9 +1351,7 @@ class ModelRunner:
                     self.max_total_num_tokens,
                     page_size=self.page_size,
                     dtype=self.kv_cache_dtype,
-                    head_num=self.model_config.get_num_kv_heads(
-                        get_attention_tp_size()
-                    ),
+                    total_head_num=self.model_config.get_num_kv_heads(1),
                     head_dim=self.model_config.head_dim,
                     layer_num=self.num_effective_layers,
                     device=self.device,
