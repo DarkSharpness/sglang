@@ -294,7 +294,10 @@ class HiRadixCache(RadixCache):
         )
 
     def writing_check(self, write_back=False):
+        from sglang.srt.managers.cache_controller import _LAST_WRITE
+
         if write_back:
+            raise NotImplementedError
             # blocking till all write back complete
             while len(self.ongoing_write_through) > 0:
                 for (
@@ -338,6 +341,7 @@ class HiRadixCache(RadixCache):
                 self.cache_controller.ack_write_queue.pop(0)
             )
             finish_event.synchronize()
+            _LAST_WRITE.pop(0)
             if self._should_log_write:
                 self._log_bandwidth(
                     start_event, finish_event, num_tokens, "Write Through"
@@ -349,6 +353,8 @@ class HiRadixCache(RadixCache):
                     self.write_backup_storage(backuped_node)
 
     def loading_check(self):
+        from sglang.srt.managers.cache_controller import _LAST_LOAD
+
         finish_count = 0
         for (
             start_event,
@@ -359,6 +365,7 @@ class HiRadixCache(RadixCache):
             if not finish_event.query():
                 # the KV cache loading is still ongoing
                 break
+            _LAST_LOAD.pop(0)
             if self._should_log_load:
                 self._log_bandwidth(start_event, finish_event, num_tokens, "Load Back")
             finish_count += 1

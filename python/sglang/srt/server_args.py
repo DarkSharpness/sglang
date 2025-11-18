@@ -1531,23 +1531,23 @@ class ServerArgs:
                     "Page first direct layout only support direct io backend"
                 )
 
-        if self.enable_hierarchical_cache and self.hicache_io_backend == "kernel":
-            # fix for the compatibility issue with FlashAttention3 decoding and HiCache kernel backend
-            if self.decode_attention_backend is None:
-                if not self.use_mla_backend():
-                    self.decode_attention_backend = (
-                        "flashinfer" if is_flashinfer_available() else "triton"
-                    )
-                else:
-                    self.decode_attention_backend = (
-                        "flashinfer" if is_sm100_supported() else "triton"
-                    )
-            elif self.decode_attention_backend == "fa3":
-                self.hicache_io_backend = "direct"
-                logger.warning(
-                    "FlashAttention3 decode backend is not compatible with hierarchical cache. "
-                    "Setting hicache_io_backend to vanilla I/O, which may lead to suboptimal performance with small page sizes."
-                )
+        # if self.enable_hierarchical_cache and self.hicache_io_backend == "kernel":
+        #     # fix for the compatibility issue with FlashAttention3 decoding and HiCache kernel backend
+        #     if self.decode_attention_backend is None:
+        #         if not self.use_mla_backend():
+        #             self.decode_attention_backend = (
+        #                 "flashinfer" if is_flashinfer_available() else "triton"
+        #             )
+        #         else:
+        #             self.decode_attention_backend = (
+        #                 "flashinfer" if is_sm100_supported() else "triton"
+        #             )
+        #     elif self.decode_attention_backend == "fa3":
+        #         self.hicache_io_backend = "direct"
+        #         logger.warning(
+        #             "FlashAttention3 decode backend is not compatible with hierarchical cache. "
+        #             "Setting hicache_io_backend to vanilla I/O, which may lead to suboptimal performance with small page sizes."
+        #         )
 
         # Below are the only parameters currently supported on Ascend
         if self.enable_hierarchical_cache and is_npu():
