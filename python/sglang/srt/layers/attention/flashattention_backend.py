@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
@@ -455,6 +456,10 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
                     forward_batch.req_pool_indices, : metadata.max_seq_len_k
                 ]
+                # bs = len(forward_batch.req_pool_indices)
+                # metadata.page_table = torch.arange(
+                #     metadata.max_seq_len_k, device=device, dtype=torch.int32
+                # ).unsqueeze(0).expand(bs, -1).contiguous()
             # TODO: we need to test this part for llama 4 eagle case
             self._init_local_attn_metadata(forward_batch, metadata, device)
         elif forward_batch.forward_mode.is_target_verify():
@@ -1042,6 +1047,7 @@ class FlashAttentionBackend(AttentionBackend):
             q = q.to(self.kv_cache_dtype)
             q_rope = q_rope.to(self.kv_cache_dtype) if q_rope is not None else None
             k_rope = k_rope.to(self.kv_cache_dtype) if k_rope is not None else None
+
         if not self.use_mla:
             # Do multi-head attention
 
@@ -1104,7 +1110,40 @@ class FlashAttentionBackend(AttentionBackend):
                     -1, layer.tp_q_head_num, layer.head_dim
                 )
 
+                # backup the metadata to host, to replay error
+                if layer.layer_id >= 0:
+                    page_table_cpu = torch.empty_like(
+                        page_table, device="cpu", pin_memory=True
+                    )
+                    page_table_cpu.copy_(page_table, non_blocking=True)
+                    cu_seqlens_q_cpu = torch.empty_like(
+                        metadata.cu_seqlens_q, device="cpu", pin_memory=True
+                    )
+                    cu_seqlens_q_cpu.copy_(metadata.cu_seqlens_q, non_blocking=True)
+                    cu_seqlens_k_cpu = torch.empty_like(
+                        cu_seqlens_k, device="cpu", pin_memory=True
+                    )
+                    cu_seqlens_k_cpu.copy_(cu_seqlens_k, non_blocking=True)
+                    cache_seqlens_int32_cpu = torch.empty_like(
+                        metadata.cache_seqlens_int32, device="cpu", pin_memory=True
+                    )
+                    cache_seqlens_int32_cpu.copy_(
+                        metadata.cache_seqlens_int32, non_blocking=True
+                    )
+
+                    host_backup_map = {
+                        "page_table": page_table_cpu,
+                        "cu_seqlens_q": cu_seqlens_q_cpu,
+                        "cu_seqlens_k": cu_seqlens_k_cpu,
+                        "cache_seqlens_int32": cache_seqlens_int32_cpu,
+                        "max_seq_len_q": metadata.max_seq_len_q,
+                        "max_seq_len_k": metadata.max_seq_len_k,
+                    }
+                    setattr(metadata, "_host_backup_map", host_backup_map)
+
                 # Default: single-token self-attention
+                stream = torch.cuda.current_stream()
+                # stream.synchronize()
                 result = flash_attn_with_kvcache(
                     q=q_reshaped,
                     k_cache=key_cache,
@@ -1124,6 +1163,26 @@ class FlashAttentionBackend(AttentionBackend):
                     num_splits=self.num_splits,
                     **kwargs,
                 )
+                try:
+                    stream.synchronize()
+                except:
+                    # must be FA3 error, restore metadata from host
+                    from sglang.srt.managers.cache_controller import (
+                        _LAST_LOAD,
+                        _LAST_WRITE,
+                    )
+
+                    time.sleep(1)
+                    print(f"Failed at layer {layer.layer_id} flash attention decode")
+                    host_backup_map = getattr(metadata, "_host_backup_map", None)
+                    assert host_backup_map is not None, "Host backup map not found!"
+                    host_backup_map["q_shape"] = q_reshaped.shape
+                    host_backup_map["last_load"] = _LAST_LOAD
+                    host_backup_map["last_write"] = _LAST_WRITE
+                    host_backup_map["layer_id"] = layer.layer_id
+                    torch.save(host_backup_map, "/root/sglang/.vscode/log/fa3_new.pkl")
+                    raise RuntimeError("FA3 flash attention with kv cache failed")
+
                 if use_cascade_attn:
                     o, softmax_lse, *rest = result
                     o_expand, softmax_lse_expand, *rest_expand = (

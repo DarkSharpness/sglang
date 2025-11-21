@@ -17,7 +17,7 @@ import logging
 import threading
 import time
 from queue import Empty, Full, Queue
-from typing import TYPE_CHECKING, List, NamedTuple, Optional
+from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple
 
 import torch
 
@@ -46,6 +46,10 @@ from sglang.srt.utils import get_device_module
 logger = logging.getLogger(__name__)
 
 device_module = get_device_module()
+
+
+_LAST_LOAD: List[Tuple[torch.Tensor, torch.Tensor]] = []
+_LAST_WRITE: List[Tuple[torch.Tensor, torch.Tensor]] = []
 
 
 class LayerLoadingEvent:
@@ -449,6 +453,7 @@ class HiCacheController:
 
         op = CacheOperation.merge_ops(self.write_queue)
         host_indices, device_indices = self.move_indices(op)
+        _LAST_WRITE.append((host_indices.cpu(), device_indices.cpu()))
         self.write_queue.clear()
 
         start_event = device_module.Event()
@@ -504,8 +509,8 @@ class HiCacheController:
                 return host_indices, device_indices.cpu()
         elif self.io_backend == "kernel_ascend":
             return host_indices, device_indices
-        else:
-            raise ValueError(f"Unsupported io backend")
+
+        raise ValueError(f"Unsupported io backend")
 
     def start_loading(self) -> int:
         if len(self.load_queue) == 0:
@@ -514,6 +519,10 @@ class HiCacheController:
         producer_id = self.layer_done_counter.update_producer()
         op = CacheOperation.merge_ops(self.load_queue)
         host_indices, device_indices = self.move_indices(op)
+        print(f"Start loading {len(host_indices)} tokens to device.")
+
+        _LAST_LOAD.append((host_indices.cpu(), device_indices.cpu()))
+
         self.load_queue.clear()
         producer_event = self.layer_done_counter.events[producer_id]
         producer_event.start_event.record()
