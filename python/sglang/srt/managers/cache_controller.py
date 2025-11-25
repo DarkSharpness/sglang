@@ -17,7 +17,7 @@ import logging
 import threading
 import time
 from queue import Empty, Full, Queue
-from typing import TYPE_CHECKING, List, NamedTuple, Optional
+from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple
 
 import torch
 
@@ -46,6 +46,9 @@ from sglang.srt.utils import get_device_module
 logger = logging.getLogger(__name__)
 
 device_module = get_device_module()
+
+_LOAD_QUEUE: List[Tuple[torch.Tensor, torch.Tensor]] = []
+_WRITE_QUEUE: List[Tuple[torch.Tensor, torch.Tensor]] = []
 
 
 class LayerLoadingEvent:
@@ -449,6 +452,9 @@ class HiCacheController:
 
         op = CacheOperation.merge_ops(self.write_queue)
         host_indices, device_indices = self.move_indices(op)
+        host_indices_cpu = host_indices.to("cpu", non_blocking=True)
+        device_indices_cpu = device_indices.to("cpu", non_blocking=True)
+        _WRITE_QUEUE.append((host_indices_cpu, device_indices_cpu))
         self.write_queue.clear()
 
         start_event = device_module.Event()
@@ -515,6 +521,11 @@ class HiCacheController:
         op = CacheOperation.merge_ops(self.load_queue)
         host_indices, device_indices = self.move_indices(op)
         self.load_queue.clear()
+
+        host_indice_cpu = host_indices.to("cpu", non_blocking=True)
+        device_indices_cpu = device_indices.to("cpu", non_blocking=True)
+        _LOAD_QUEUE.append((host_indice_cpu, device_indices_cpu))
+
         producer_event = self.layer_done_counter.events[producer_id]
         producer_event.start_event.record()
 

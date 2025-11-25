@@ -255,6 +255,7 @@ class HiRadixCache(RadixCache):
 
     def writing_check(self, write_back=False):
         if write_back:
+            raise NotImplementedError("Not supported")
             # blocking till all write back complete
             while len(self.ongoing_write_through) > 0:
                 for _, finish_event, ack_list in self.cache_controller.ack_write_queue:
@@ -283,9 +284,12 @@ class HiRadixCache(RadixCache):
                 group=self.tp_group,
             )
 
+        from sglang.srt.managers.cache_controller import _WRITE_QUEUE
+
         finish_count = int(queue_size.item())
         while finish_count > 0:
             _, finish_event, ack_list = self.cache_controller.ack_write_queue.pop(0)
+            _WRITE_QUEUE.pop(0)  # remove the corresponding entry
             finish_event.synchronize()
             for ack_id in ack_list:
                 backuped_node = self.ongoing_write_through.pop(ack_id)
@@ -295,12 +299,15 @@ class HiRadixCache(RadixCache):
             finish_count -= 1
 
     def loading_check(self):
+        from sglang.srt.managers.cache_controller import _LOAD_QUEUE
+
         finish_count = 0
         for _, finish_event, ack_list in self.cache_controller.ack_load_queue:
             if not finish_event.query():
                 # the KV cache loading is still ongoing
                 break
             finish_count += 1
+            _LOAD_QUEUE.pop(0)  # remove the corresponding entry
             # no need to sync across TP workers as batch forwarding is synced
             for ack_id in ack_list:
                 end_node = self.ongoing_load_back.pop(ack_id)

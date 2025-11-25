@@ -40,6 +40,7 @@ def can_use_hicache_jit_kernel(
     unroll: int | None = None,  # can be tuned for performance
     block_quota: int | None = None,  # can be tuned for less interference
 ) -> bool:
+    return False
     try:
         unroll = unroll or _default_unroll(element_size)
         block_quota = block_quota or DEFAULT_BLOCK_QUOTA

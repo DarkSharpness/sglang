@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
@@ -1104,6 +1105,35 @@ class FlashAttentionBackend(AttentionBackend):
                     -1, layer.tp_q_head_num, layer.head_dim
                 )
 
+                if layer.layer_id == 0:
+                    assert not use_cascade_attn
+                    q_shape = q_reshaped.shape
+                    page_table_host = page_table.to("cpu", non_blocking=True)
+                    cache_seqlens_host = cache_seqlens.to("cpu", non_blocking=True)
+                    cu_seqlens_k_host = cu_seqlens_k.to("cpu", non_blocking=True)
+                    cu_seqlens_q_host = metadata.cu_seqlens_q.to(
+                        "cpu", non_blocking=True
+                    )
+                    key_cache_shape = key_cache.shape
+                    value_cache_shape = value_cache.shape
+                    metadata_map = {
+                        "q_shape": q_shape,
+                        "k_cache_shape": key_cache_shape,
+                        "v_cache_shape": value_cache_shape,
+                        "page_table": page_table_host,
+                        "cache_seqlens": cache_seqlens_host,
+                        "cu_seqlens_k": cu_seqlens_k_host,
+                        "cu_seqlens_q_host": cu_seqlens_q_host,
+                        "max_seqlen_q": max_seqlen_q,
+                        "softmax_scale": layer.scaling,
+                        "window_size": window_size,
+                        "softcap": layer.logit_cap,
+                        "k_descale": k_descale,
+                        "v_descale": v_descale,
+                        "num_splits": self.num_splits,
+                    }
+                    setattr(metadata, "decode_metadata", metadata_map)
+
                 # Default: single-token self-attention
                 result = flash_attn_with_kvcache(
                     q=q_reshaped,
@@ -1124,6 +1154,25 @@ class FlashAttentionBackend(AttentionBackend):
                     num_splits=self.num_splits,
                     **kwargs,
                 )
+                try:
+                    torch.cuda.current_stream().synchronize()
+                except Exception as e:
+                    from sglang.srt.managers.cache_controller import (
+                        _LOAD_QUEUE,
+                        _WRITE_QUEUE,
+                    )
+
+                    time.sleep(0.1)  # wait
+                    metadata_map = getattr(metadata, "decode_metadata", None)
+                    assert metadata_map is not None, "metadata_map should not be None"
+                    metadata_map["layer_id"] = layer.layer_id
+                    metadata_map["load_queue"] = _LOAD_QUEUE
+                    metadata_map["write_queue"] = _WRITE_QUEUE
+                    torch.save(metadata_map, ".vscode/log/fa3.pkl")
+                    raise RuntimeError(
+                        f"FA3 error at layer {layer.layer_id}: {e}"
+                    ) from e
+
                 if use_cascade_attn:
                     o, softmax_lse, *rest = result
                     o_expand, softmax_lse_expand, *rest_expand = (
