@@ -1,3 +1,4 @@
+#include <sgl_kernel/norm.cuh>
 #include <sgl_kernel/runtime.cuh>
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.cuh>
@@ -12,30 +13,8 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <type_traits>
 
 namespace {
-
-[[maybe_unused]]
-__device__ auto to_float2(nv_bfloat162 x) -> float2 {
-  return __bfloat1622float2(x);
-}
-
-[[maybe_unused]]
-__device__ auto to_float2(half2 x) -> float2 {
-  return __half22float2(x);
-}
-
-template <typename T>
-__device__ auto from_float2(float2 x) -> T {
-  if constexpr (std::is_same_v<T, nv_bfloat162>) {
-    return __float22bfloat162_rn(x);
-  } else if constexpr (std::is_same_v<T, half2>) {
-    return __float22half2_rn(x);
-  } else {
-    static_assert(sizeof(T) == 0, "Unsupported type");
-  }
-}
 
 struct QKNormParams {
   void* __restrict__ q;
@@ -54,37 +33,12 @@ template <int64_t kHeadDim, typename PackedFloat>
 __always_inline __device__ void apply_norm(void* __restrict__ input, const void* __restrict__ weight, float eps) {
   using namespace device;
 
-  constexpr std::size_t kLoopCount = kHeadDim / (kWarpThreads * 2);
   static_assert(kHeadDim % (kWarpThreads * 2) == 0);
-
-  float sum_of_squares = 0.0f;
-
+  constexpr std::size_t kLoopCount = kHeadDim / (kWarpThreads * 2);
   using vec_t = aligned_vector<PackedFloat, kLoopCount>;
   const auto input_vec = warp::load<vec_t>(input);
-
-#pragma unroll
-  for (auto i = 0u; i < kLoopCount; ++i) {
-    const auto fp16_input = input_vec[i];
-    const auto fp32_input = to_float2(fp16_input);
-    sum_of_squares += fp32_input.x * fp32_input.x;
-    sum_of_squares += fp32_input.y * fp32_input.y;
-  }
-
-  sum_of_squares = warp::reduce_sum(sum_of_squares);
-  const auto norm_factor = rsqrtf(sum_of_squares / kHeadDim + eps);
   const auto weight_vec = warp::load<vec_t>(weight);
-  vec_t output_vec;
-
-#pragma unroll
-  for (auto i = 0u; i < kLoopCount; ++i) {
-    const auto fp32_input = to_float2(input_vec[i]);
-    const auto fp32_weight = to_float2(weight_vec[i]);
-    output_vec[i] = from_float2<PackedFloat>({
-        fp32_input.x * norm_factor * fp32_weight.x,
-        fp32_input.y * norm_factor * fp32_weight.y,
-    });
-  }
-
+  const auto output_vec = apply_norm_impl<kHeadDim>(input_vec, weight_vec, eps);
   warp::store(input, output_vec);
 }
 
