@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 
@@ -72,6 +72,29 @@ def _jit_fused_add_rmsnorm_module(dtype: torch.dtype) -> Module:
         *args,
         cuda_files=["elementwise/fused_add_rmsnorm.cuh"],
         cuda_wrappers=[("fused_add_rmsnorm", f"FusedAddRMSNormKernel<{args}>::run")],
+    )
+
+
+_FUSED_DOUBLE_RMSNORM_MAX_HIDDEN_SIZE = 8192
+
+
+def _is_supported_fused_double_rmsnorm_hidden_size(d: int) -> bool:
+    return d > 256 and d % 256 == 0 and d <= _FUSED_DOUBLE_RMSNORM_MAX_HIDDEN_SIZE
+
+
+@cache_once
+def _jit_fused_double_rmsnorm_module(hidden_size: int, dtype: torch.dtype) -> Module:
+    args = make_cpp_args(hidden_size, is_arch_support_pdl(), dtype)
+    return load_jit(
+        "fused_double_rmsnorm",
+        *args,
+        cuda_files=["elementwise/fused_double_rmsnorm.cuh"],
+        cuda_wrappers=[
+            (
+                "fused_double_rmsnorm",
+                f"FusedDoubleRMSNormKernel<{args}>::run",
+            )
+        ],
     )
 
 
@@ -167,3 +190,35 @@ def fused_inplace_qknorm_across_heads(
     """
     module = _jit_qknorm_across_heads_module(q.dtype)
     module.qknorm_across_heads(q, k, q_weight, k_weight, eps)
+
+
+@debug_kernel_api
+def fused_double_rmsnorm(
+    input: torch.Tensor,
+    residual: torch.Tensor,
+    weight1: torch.Tensor,
+    weight2: torch.Tensor,
+    eps: float = 1e-6,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Fused double RMSNorm.
+
+    normed1      = rmsnorm(input, weight1, eps)
+    residual_out = normed1 + residual
+    output       = rmsnorm(residual_out, weight2, eps)
+
+    Returns:
+        (output, residual_out)
+    """
+    hidden_size = input.size(-1)
+    if not _is_supported_fused_double_rmsnorm_hidden_size(hidden_size):
+        raise RuntimeError(
+            f"jit fused_double_rmsnorm: unsupported hidden_size={hidden_size}. "
+            f"Supported: multiples of 256 in (256, {_FUSED_DOUBLE_RMSNORM_MAX_HIDDEN_SIZE}]."
+        )
+    output = torch.empty_like(input)
+    residual_out = torch.empty_like(input)
+    module = _jit_fused_double_rmsnorm_module(hidden_size, input.dtype)
+    module.fused_double_rmsnorm(
+        input, residual, weight1, weight2, output, residual_out, eps
+    )
+    return output, residual_out
