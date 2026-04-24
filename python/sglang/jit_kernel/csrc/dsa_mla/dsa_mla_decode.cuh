@@ -43,12 +43,14 @@ constexpr int DV_PER_WARP   = D_V / NUM_WARPS; // 128
 __device__ __forceinline__ uint32_t smem_u32(const void* p) {
   return __cvta_generic_to_shared(const_cast<void*>(p));
 }
+// cp.async.cg.shared.global.L2::256B: bypass L1 → larger in-flight queue, and the .L2::256B hint
+// coalesces 256-byte bursts (our row stride of 576B helps this).
 __device__ __forceinline__ void cp_async_16_pred(void* smem_dst, const void* gmem_src, bool pred) {
   uint32_t s = smem_u32(smem_dst);
   if (pred) {
-    asm volatile("cp.async.ca.shared.global [%0], [%1], 16;\n" : : "r"(s), "l"(gmem_src));
+    asm volatile("cp.async.cg.shared.global.L2::256B [%0], [%1], 16;\n" : : "r"(s), "l"(gmem_src));
   } else {
-    asm volatile("cp.async.ca.shared.global [%0], [%1], 16, 0;\n" : : "r"(s), "l"(gmem_src));
+    asm volatile("cp.async.cg.shared.global.L2::256B [%0], [%1], 16, 0;\n" : : "r"(s), "l"(gmem_src));
   }
 }
 __device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;\n" ::); }
@@ -449,6 +451,7 @@ void dsa_mla_decode(
     tvm::ffi::TensorView sparse_indices,
     tvm::ffi::TensorView output,
     tvm::ffi::TensorView lse,
+    tvm::ffi::TensorView workspace,
     double sm_scale) {
   using namespace dsa_mla_ns;
   using namespace host;
@@ -464,6 +467,8 @@ void dsa_mla_decode(
   TensorMatcher({Ntok, (int64_t)TOPK}).with_dtype<int32_t>().with_device<kDLCUDA>(dev_).verify(sparse_indices);
   TensorMatcher({Ntok, (int64_t)NUM_HEADS, (int64_t)D_V}).with_dtype<bf16_t>().with_device<kDLCUDA>(dev_).verify(output);
   TensorMatcher({Ntok, (int64_t)NUM_HEADS}).with_dtype<float>().with_device<kDLCUDA>(dev_).verify(lse);
+  // workspace is bytes (uint8) 1D, validated loosely.
+  RuntimeCheck(workspace.device().device_type == kDLCUDA, "workspace must be CUDA");
 
   const int32_t num_tokens = static_cast<int32_t>(Ntok.unwrap());
   const int32_t num_pages  = static_cast<int32_t>(Npage.unwrap());
@@ -504,16 +509,16 @@ void dsa_mla_decode(
         static_cast<float*>(lse.data_ptr()),
         num_tokens, num_kv_tokens, 1, sm_scale_log2);
   } else {
-    // Allocate scratch via thrust/torch allocator is not readily available here; use per-call
-    // cudaMalloc (will be cached by the allocator).  For correctness we go with plain malloc on
-    // the device side first; real path should reuse a workspace.
-    // NB: this path is NOT zero-overhead; we'll replace with a workspace in a follow-up.
+    // Carve workspace: [o_accum float[S,T,16,512]][lse_accum float[S,T,16]] with alignment.
     size_t o_bytes   = (size_t)num_splits * num_tokens * NUM_HEADS * D_V * sizeof(float);
     size_t lse_bytes = (size_t)num_splits * num_tokens * NUM_HEADS     * sizeof(float);
-    float* o_accum = nullptr;
-    float* lse_accum = nullptr;
-    cudaMallocAsync((void**)&o_accum, o_bytes, stream);
-    cudaMallocAsync((void**)&lse_accum, lse_bytes, stream);
+    size_t total_need = o_bytes + lse_bytes;
+    RuntimeCheck(
+        (size_t)workspace.size(0) >= total_need,
+        "workspace too small: have ", workspace.size(0), " need ", total_need);
+    char* ws = static_cast<char*>(workspace.data_ptr());
+    float* o_accum   = reinterpret_cast<float*>(ws);
+    float* lse_accum = reinterpret_cast<float*>(ws + o_bytes);
 
     dim3 grid(num_tokens * num_splits);
     dim3 block(NUM_THREADS);
@@ -534,8 +539,5 @@ void dsa_mla_decode(
         static_cast<bf16*>(output.data_ptr()),
         static_cast<float*>(lse.data_ptr()),
         num_splits, num_tokens);
-
-    cudaFreeAsync(o_accum, stream);
-    cudaFreeAsync(lse_accum, stream);
   }
 }

@@ -125,6 +125,23 @@ def _jit_module() -> "Module":
         )
 
 
+_WORKSPACE_CACHE: dict = {}
+
+
+def _get_workspace(device: torch.device, min_bytes: int) -> torch.Tensor:
+    key = (device, "workspace")
+    ws = _WORKSPACE_CACHE.get(key)
+    if ws is None or ws.numel() < min_bytes:
+        ws = torch.empty((min_bytes,), dtype=torch.uint8, device=device)
+        _WORKSPACE_CACHE[key] = ws
+    return ws
+
+
+# Upper bound for workspace: max num_splits=32, max num_tokens=64 (overshoot for safety).
+# o_accum: 32 × 64 × 16 × 512 × 4 B = 64 MB; lse_accum: 32 × 64 × 16 × 4 B = 128 KB.
+_MAX_WORKSPACE_BYTES = 64 * 1024 * 1024 + 1024 * 1024  # ~65 MB
+
+
 def dsa_mla_decode(
     q_nope: torch.Tensor,
     q_pe: torch.Tensor,
@@ -134,10 +151,13 @@ def dsa_mla_decode(
     sm_scale: float,
     output: torch.Tensor | None = None,
     lse: torch.Tensor | None = None,
+    workspace: torch.Tensor | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Run the sparse MLA decode kernel.
 
     Shapes are fixed by benchmark spec (h16/ckv512/kpe64/topk2048/ps64).
+
+    If `workspace` is not provided, a cached per-device buffer is used (lazily grown).
     """
     num_tokens = q_nope.size(0)
     device = q_nope.device
@@ -151,6 +171,13 @@ def dsa_mla_decode(
         lse = torch.empty(
             (num_tokens, NUM_QO_HEADS), dtype=torch.float32, device=device
         )
+    # Workspace sizing (upper bound):
+    #   o_accum   : num_splits(≤32) × num_tokens × 16 × 512 × 4 B
+    #   lse_accum : num_splits(≤32) × num_tokens × 16 × 4 B
+    per_t_bytes = 32 * NUM_QO_HEADS * (HEAD_DIM_CKV * 4 + 4)
+    need = num_tokens * per_t_bytes + 1024
+    if workspace is None:
+        workspace = _get_workspace(device, need)
     module = _jit_module()
     module.dsa_mla_decode(
         q_nope,
@@ -160,6 +187,7 @@ def dsa_mla_decode(
         sparse_indices,
         output,
         lse,
+        workspace,
         float(sm_scale),
     )
     return output, lse
