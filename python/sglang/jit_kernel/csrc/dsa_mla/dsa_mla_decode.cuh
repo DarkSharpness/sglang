@@ -181,37 +181,45 @@ __global__ void dsa_mla_decode_split_kernel(
     __syncthreads();
 
     // QK^T: warp w computes S[:, w*16 : w*16+16].
+    // ILP-friendly version: 8 independent accumulators (one per output col) updated in parallel.
     {
       const int row = lane % 16;
       const int col_base = (lane / 16) * 8;
+      int kv_row_base = warp_id * 16 + col_base;
+      float acc[8];
       #pragma unroll
-      for (int c = 0; c < 8; ++c) {
-        int kv_row = warp_id * 16 + col_base + c;
-        float acc = 0.f;
+      for (int c = 0; c < 8; ++c) acc[c] = 0.f;
+      #pragma unroll 2
+      for (int k = 0; k < D_QK; k += 8) {
+        // Preload q once per k-step.
+        bf162 q0 = *reinterpret_cast<bf162*>(&sQ[row * D_QK + k]);
+        bf162 q1 = *reinterpret_cast<bf162*>(&sQ[row * D_QK + k + 2]);
+        bf162 q2 = *reinterpret_cast<bf162*>(&sQ[row * D_QK + k + 4]);
+        bf162 q3 = *reinterpret_cast<bf162*>(&sQ[row * D_QK + k + 6]);
+        float2 q0f = __bfloat1622float2(q0);
+        float2 q1f = __bfloat1622float2(q1);
+        float2 q2f = __bfloat1622float2(q2);
+        float2 q3f = __bfloat1622float2(q3);
         #pragma unroll
-        for (int k = 0; k < D_QK; k += 8) {
-          bf162 q0 = *reinterpret_cast<bf162*>(&sQ[row * D_QK + k]);
-          bf162 q1 = *reinterpret_cast<bf162*>(&sQ[row * D_QK + k + 2]);
-          bf162 q2 = *reinterpret_cast<bf162*>(&sQ[row * D_QK + k + 4]);
-          bf162 q3 = *reinterpret_cast<bf162*>(&sQ[row * D_QK + k + 6]);
+        for (int c = 0; c < 8; ++c) {
+          int kv_row = kv_row_base + c;
           bf162 k0 = *reinterpret_cast<bf162*>(&sK[kv_row * D_QK + k]);
           bf162 k1 = *reinterpret_cast<bf162*>(&sK[kv_row * D_QK + k + 2]);
           bf162 k2 = *reinterpret_cast<bf162*>(&sK[kv_row * D_QK + k + 4]);
           bf162 k3 = *reinterpret_cast<bf162*>(&sK[kv_row * D_QK + k + 6]);
-          float2 q0f = __bfloat1622float2(q0);
-          float2 q1f = __bfloat1622float2(q1);
-          float2 q2f = __bfloat1622float2(q2);
-          float2 q3f = __bfloat1622float2(q3);
           float2 k0f = __bfloat1622float2(k0);
           float2 k1f = __bfloat1622float2(k1);
           float2 k2f = __bfloat1622float2(k2);
           float2 k3f = __bfloat1622float2(k3);
-          acc += q0f.x * k0f.x + q0f.y * k0f.y
-               + q1f.x * k1f.x + q1f.y * k1f.y
-               + q2f.x * k2f.x + q2f.y * k2f.y
-               + q3f.x * k3f.x + q3f.y * k3f.y;
+          acc[c] += q0f.x * k0f.x + q0f.y * k0f.y
+                  + q1f.x * k1f.x + q1f.y * k1f.y
+                  + q2f.x * k2f.x + q2f.y * k2f.y
+                  + q3f.x * k3f.x + q3f.y * k3f.y;
         }
-        sS[row * B_TOPK + warp_id * 16 + col_base + c] = acc;
+      }
+      #pragma unroll
+      for (int c = 0; c < 8; ++c) {
+        sS[row * B_TOPK + kv_row_base + c] = acc[c];
       }
     }
     __syncthreads();
