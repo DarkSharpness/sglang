@@ -56,9 +56,16 @@ __device__ __forceinline__ void cp_async_16_pred(void* smem_dst, const void* gme
 __device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;\n" ::); }
 __device__ __forceinline__ void cp_async_wait_all() { asm volatile("cp.async.wait_all;\n" ::); }
 
+// D_QK=576 means per-row byte stride = 1152 B = 288 × 4B banks.  288 % 32 = 0, so threads
+// accessing the same col across rows hit the same bank — 16-way conflict in QK.
+// Pad each row with 8 bf16 (16B) so stride becomes 584 bf16 = 292 banks → 292%32=4.
+// Rows 0 and 8 still share bank (4-way conflict), but that's 4x better than 16x.
+constexpr int SMEM_ROW_PAD_BF16 = 8;
+constexpr int STRIDE_QK_BF16    = D_QK + SMEM_ROW_PAD_BF16;    // 584
+
 struct SmemLayout {
-  static constexpr int Q_BYTES = B_H    * D_QK * 2;
-  static constexpr int K_BYTES = B_TOPK * D_QK * 2;
+  static constexpr int Q_BYTES = B_H    * STRIDE_QK_BF16 * 2;
+  static constexpr int K_BYTES = B_TOPK * STRIDE_QK_BF16 * 2;
   static constexpr int S_BYTES = B_H    * B_TOPK * 4;
   static constexpr int P_BYTES = B_H    * B_TOPK * 2;
   static constexpr int TOTAL   = Q_BYTES + K_BYTES + S_BYTES + P_BYTES;
@@ -78,7 +85,7 @@ __device__ __forceinline__ void load_q(bf16* sQ, const bf16* q_nope, const bf16*
   #pragma unroll
   for (int v = 0; v < VECS_PER_THR; ++v) {
     int vidx = colg * VECS_PER_THR + v;
-    bf16* dst = sQ + row * D_QK + vidx * VEC;
+    bf16* dst = sQ + row * STRIDE_QK_BF16 + vidx * VEC;
     const bf16* src = (vidx < D_CKV / VEC) ? (q_nope + row * D_CKV + vidx * VEC)
                                             : (q_pe + row * D_KPE + (vidx - D_CKV / VEC) * VEC);
     cp_async_16_pred(dst, src, true);
@@ -99,7 +106,7 @@ __device__ __forceinline__ void load_k_block(
   #pragma unroll
   for (int v = 0; v < VECS_PER_THR; ++v) {
     int vidx = colg * VECS_PER_THR + v;
-    bf16* dst = sK + row * D_QK + vidx * VEC;
+    bf16* dst = sK + row * STRIDE_QK_BF16 + vidx * VEC;
     const bf16* src = (vidx < D_CKV / VEC) ? (ckv + tok * D_CKV + vidx * VEC)
                                             : (kpe + tok * D_KPE + (vidx - D_CKV / VEC) * VEC);
     cp_async_16_pred(dst, src, valid);
@@ -191,10 +198,10 @@ __global__ void dsa_mla_decode_split_kernel(
       #pragma unroll
       for (int c = 0; c < 8; ++c) acc[c] = 0.f;
       for (int k = 0; k < D_QK; k += 8) {
-        bf162 q0 = *reinterpret_cast<bf162*>(&sQ[row * D_QK + k]);
-        bf162 q1 = *reinterpret_cast<bf162*>(&sQ[row * D_QK + k + 2]);
-        bf162 q2 = *reinterpret_cast<bf162*>(&sQ[row * D_QK + k + 4]);
-        bf162 q3 = *reinterpret_cast<bf162*>(&sQ[row * D_QK + k + 6]);
+        bf162 q0 = *reinterpret_cast<bf162*>(&sQ[row * STRIDE_QK_BF16 + k]);
+        bf162 q1 = *reinterpret_cast<bf162*>(&sQ[row * STRIDE_QK_BF16 + k + 2]);
+        bf162 q2 = *reinterpret_cast<bf162*>(&sQ[row * STRIDE_QK_BF16 + k + 4]);
+        bf162 q3 = *reinterpret_cast<bf162*>(&sQ[row * STRIDE_QK_BF16 + k + 6]);
         float2 q0f = __bfloat1622float2(q0);
         float2 q1f = __bfloat1622float2(q1);
         float2 q2f = __bfloat1622float2(q2);
@@ -202,10 +209,10 @@ __global__ void dsa_mla_decode_split_kernel(
         #pragma unroll
         for (int c = 0; c < 8; ++c) {
           int kv_row = kv_row_base + c;
-          bf162 k0 = *reinterpret_cast<bf162*>(&sK[kv_row * D_QK + k]);
-          bf162 k1 = *reinterpret_cast<bf162*>(&sK[kv_row * D_QK + k + 2]);
-          bf162 k2 = *reinterpret_cast<bf162*>(&sK[kv_row * D_QK + k + 4]);
-          bf162 k3 = *reinterpret_cast<bf162*>(&sK[kv_row * D_QK + k + 6]);
+          bf162 k0 = *reinterpret_cast<bf162*>(&sK[kv_row * STRIDE_QK_BF16 + k]);
+          bf162 k1 = *reinterpret_cast<bf162*>(&sK[kv_row * STRIDE_QK_BF16 + k + 2]);
+          bf162 k2 = *reinterpret_cast<bf162*>(&sK[kv_row * STRIDE_QK_BF16 + k + 4]);
+          bf162 k3 = *reinterpret_cast<bf162*>(&sK[kv_row * STRIDE_QK_BF16 + k + 6]);
           float2 k0f = __bfloat1622float2(k0);
           float2 k1f = __bfloat1622float2(k1);
           float2 k2f = __bfloat1622float2(k2);
@@ -267,8 +274,8 @@ __global__ void dsa_mla_decode_split_kernel(
         float acc0 = rO[r][0], acc1 = rO[r][1], acc2 = rO[r][2], acc3 = rO[r][3];
         for (int k = 0; k < B_TOPK; ++k) {
           float p = __bfloat162float(sP[r * B_TOPK + k]);
-          bf162 v01 = *reinterpret_cast<bf162*>(&sK[k * D_QK + col_base_warp]);
-          bf162 v23 = *reinterpret_cast<bf162*>(&sK[k * D_QK + col_base_warp + 2]);
+          bf162 v01 = *reinterpret_cast<bf162*>(&sK[k * STRIDE_QK_BF16 + col_base_warp]);
+          bf162 v23 = *reinterpret_cast<bf162*>(&sK[k * STRIDE_QK_BF16 + col_base_warp + 2]);
           float2 v01f = __bfloat1622float2(v01);
           float2 v23f = __bfloat1622float2(v23);
           acc0 += p * v01f.x;
@@ -435,10 +442,9 @@ __global__ void dsa_mla_combine_kernel(
   }
 }
 
-// Choose num_splits — return a divisor of NUM_KV_BLOCKS (=32) bounded by SM count.
+// Choose num_splits — prefer divisors of NUM_KV_BLOCKS for balanced work.
 __host__ inline int choose_num_splits(int num_tokens, int num_sms) {
-  int want = (num_sms + num_tokens - 1) / num_tokens;   // CTAs per token
-  // Round down to the nearest divisor of NUM_KV_BLOCKS in {32,16,8,4,2,1}.
+  int want = (num_sms + num_tokens - 1) / num_tokens;
   int candidates[] = {32, 16, 8, 4, 2, 1};
   for (int c : candidates) {
     if (c <= want) return c;
