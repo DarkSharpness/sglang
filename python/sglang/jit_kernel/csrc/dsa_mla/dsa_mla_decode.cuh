@@ -1,6 +1,10 @@
 // DeepSeek Sparse Attention (DSA) MLA decode kernel — SM100 (B200) / h_q = 16.
 //
-// V0 (baseline, no mma): naive FMA loop for correctness. Slow but easy to debug.
+// V1: split-KV across SMs.
+//   Each CTA processes (token, split_idx) where split_idx selects a contiguous slice of the
+//   32 KV blocks.  Partial (o_accum, lse_accum) are written; a combine kernel merges.
+//   Grid: (num_tokens * num_splits, 1, 1)
+//   num_splits = min(NUM_KV_BLOCKS, max(148 / num_tokens, 1)) rounded to divide NUM_KV_BLOCKS.
 
 #pragma once
 
@@ -19,23 +23,23 @@ namespace dsa_mla_ns {
 using bf16  = __nv_bfloat16;
 using bf162 = __nv_bfloat162;
 
-constexpr int NUM_HEADS   = 16;
-constexpr int D_CKV       = 512;
-constexpr int D_KPE       = 64;
-constexpr int D_QK        = D_CKV + D_KPE;
-constexpr int D_V         = 512;
-constexpr int PAGE_SIZE   = 64;
-constexpr int TOPK        = 2048;
+constexpr int NUM_HEADS     = 16;
+constexpr int D_CKV         = 512;
+constexpr int D_KPE         = 64;
+constexpr int D_QK          = D_CKV + D_KPE;   // 576
+constexpr int D_V           = 512;
+constexpr int PAGE_SIZE     = 64;
+constexpr int TOPK          = 2048;
 
-constexpr int B_H         = 16;
-constexpr int B_TOPK      = 64;
-constexpr int NUM_WARPS   = 4;
-constexpr int NUM_THREADS = NUM_WARPS * 32;
-constexpr int NUM_KV_BLOCKS = TOPK / B_TOPK;
+constexpr int B_H           = 16;
+constexpr int B_TOPK        = 64;
+constexpr int NUM_WARPS     = 4;
+constexpr int NUM_THREADS   = NUM_WARPS * 32;
+constexpr int NUM_KV_BLOCKS = TOPK / B_TOPK;   // 32
 
-constexpr int DV_PER_WARP = D_V / NUM_WARPS;  // 128
+constexpr int DV_PER_WARP   = D_V / NUM_WARPS; // 128
 
-// -------- PTX helpers --------
+// ------------------ PTX helpers ------------------
 __device__ __forceinline__ uint32_t smem_u32(const void* p) {
   return __cvta_generic_to_shared(const_cast<void*>(p));
 }
@@ -51,10 +55,10 @@ __device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commi
 __device__ __forceinline__ void cp_async_wait_all() { asm volatile("cp.async.wait_all;\n" ::); }
 
 struct SmemLayout {
-  static constexpr int Q_BYTES = B_H    * D_QK * 2;  // 18,432
-  static constexpr int K_BYTES = B_TOPK * D_QK * 2;  // 73,728
-  static constexpr int S_BYTES = B_H    * B_TOPK * 4; //  4,096
-  static constexpr int P_BYTES = B_H    * B_TOPK * 2; //  2,048
+  static constexpr int Q_BYTES = B_H    * D_QK * 2;
+  static constexpr int K_BYTES = B_TOPK * D_QK * 2;
+  static constexpr int S_BYTES = B_H    * B_TOPK * 4;
+  static constexpr int P_BYTES = B_H    * B_TOPK * 2;
   static constexpr int TOTAL   = Q_BYTES + K_BYTES + S_BYTES + P_BYTES;
   __device__ static bf16*  q(char* p) { return reinterpret_cast<bf16*> (p); }
   __device__ static bf16*  k(char* p) { return reinterpret_cast<bf16*> (p + Q_BYTES); }
@@ -64,10 +68,9 @@ struct SmemLayout {
 
 __device__ __forceinline__ void load_q(bf16* sQ, const bf16* q_nope, const bf16* q_pe, int tid) {
   constexpr int VEC = 8;
-  constexpr int ROWS = B_H;
-  constexpr int THR_PER_ROW = NUM_THREADS / ROWS;  // 8
-  constexpr int VECS_PER_ROW = D_QK / VEC;  // 72
-  constexpr int VECS_PER_THR = VECS_PER_ROW / THR_PER_ROW;  // 9
+  constexpr int THR_PER_ROW = NUM_THREADS / B_H;              // 8
+  constexpr int VECS_PER_ROW = D_QK / VEC;                     // 72
+  constexpr int VECS_PER_THR = VECS_PER_ROW / THR_PER_ROW;     // 9
   const int row = tid / THR_PER_ROW;
   const int colg = tid % THR_PER_ROW;
   #pragma unroll
@@ -84,10 +87,9 @@ __device__ __forceinline__ void load_k_block(
     bf16* sK, const int32_t* idx, const bf16* ckv, const bf16* kpe,
     int32_t num_kv, int tid) {
   constexpr int VEC = 8;
-  constexpr int ROWS = B_TOPK;
-  constexpr int THR_PER_ROW = NUM_THREADS / ROWS;  // 2
-  constexpr int VECS_PER_ROW = D_QK / VEC;  // 72
-  constexpr int VECS_PER_THR = VECS_PER_ROW / THR_PER_ROW;  // 36
+  constexpr int THR_PER_ROW = NUM_THREADS / B_TOPK;            // 2
+  constexpr int VECS_PER_ROW = D_QK / VEC;                      // 72
+  constexpr int VECS_PER_THR = VECS_PER_ROW / THR_PER_ROW;      // 36
   const int row = tid / THR_PER_ROW;
   const int colg = tid % THR_PER_ROW;
   const int32_t tok = idx[row];
@@ -102,18 +104,46 @@ __device__ __forceinline__ void load_k_block(
   }
 }
 
+// ---------------- split-kv main kernel ----------------
+//
+// Processes KV blocks [block_start, block_end) of query `t`.  Produces:
+//   o_accum   [num_splits, num_tokens, NUM_HEADS, D_V]  (float)
+//   lse_accum [num_splits, num_tokens, NUM_HEADS]       (float, log2 base)
+//
+// If num_splits == 1 we write straight to the final output instead of accum.
+
 __launch_bounds__(NUM_THREADS, 1)
-__global__ void dsa_mla_decode_kernel_v0(
-    const bf16* q_nope, const bf16* q_pe,
-    const bf16* ckv, const bf16* kpe,
-    const int32_t* indices,
-    bf16* output, float* lse_out,
-    int32_t num_tokens, int32_t num_kv, float sm_scale_log2) {
-  const int t = blockIdx.x;
+__global__ void dsa_mla_decode_split_kernel(
+    const bf16* q_nope,       // [T, 16, 512]
+    const bf16* q_pe,         // [T, 16, 64]
+    const bf16* ckv,          // [P, 64, 512]
+    const bf16* kpe,          // [P, 64, 64]
+    const int32_t* indices,   // [T, 2048]
+    float* o_accum,           // [S, T, 16, 512]  (or null if num_splits==1 → write out)
+    float* lse_accum,         // [S, T, 16]        (or null if num_splits==1 → write lse)
+    bf16*  final_out,         // [T, 16, 512]      (used if num_splits==1)
+    float* final_lse,         // [T, 16]           (used if num_splits==1)
+    int32_t num_tokens,
+    int32_t num_kv,
+    int32_t num_splits,
+    float sm_scale_log2)
+{
+  const int bid     = blockIdx.x;
+  const int t       = bid / num_splits;
+  const int split   = bid % num_splits;
   if (t >= num_tokens) return;
-  const int tid = threadIdx.x;
+
+  // Compute [block_start, block_end) for this split.
+  // Split blocks roughly evenly: base = NUM_KV_BLOCKS / num_splits, extras = NUM_KV_BLOCKS % num_splits.
+  const int base    = NUM_KV_BLOCKS / num_splits;
+  const int extras  = NUM_KV_BLOCKS % num_splits;
+  const int blk_start = split * base + (split < extras ? split : extras);
+  const int blk_end   = blk_start + base + (split < extras ? 1 : 0);
+  if (blk_start >= blk_end) return;
+
+  const int tid     = threadIdx.x;
   const int warp_id = tid / 32;
-  const int lane = tid % 32;
+  const int lane    = tid % 32;
 
   extern __shared__ __align__(16) char smem[];
   bf16*  sQ = SmemLayout::q(smem);
@@ -125,28 +155,8 @@ __global__ void dsa_mla_decode_kernel_v0(
   __shared__ float rowsum_s[B_H];
   if (tid < B_H) { rowmax_s[tid] = -INFINITY; rowsum_s[tid] = 0.f; }
 
-  // O accumulator (FP32) in registers.  Each warp owns 128 cols of d_v.
-  // Layout: each thread handles a contiguous block of rows × cols.  For 16 rows × 128 cols =
-  // 2048 elements / 32 threads per warp = 64 elements per thread.
-  //
-  // Simple partition: thread owns rows = lane/2, and cols = (lane%2)*64..(lane%2)*64+64 within warp.
-  // Wait — this would be 1 row per thread × 64 cols = 64 elts ✓.  But some threads get the same row.
-  //
-  // Cleaner: 32 threads split 16×128 = 2048 elements → 64 per thread.  Each thread owns a 2-row ×
-  // 32-col slab? Let's do: thread lane owns rows (lane / 8)   [0..3] and cols (lane % 8) * 16 + [0..15]
-  //    → 4 rows × 16 cols = 64 ✓.
-  // No wait — 32 threads × (rows × cols) = 16 × 128. 16 × 128 / 32 = 64 ✓.
-  // Split: 4 rows × 8 threads (col dim).  rows_per_thread = 4 (lane/8), cols_per_thread = 16 (lane%8 * 16).
-  //   So 4 warps × 4 rows = 16 rows ✓.  But each warp should cover all 16 rows (M=16), with N=128.
-  //   Actually, cleaner for ALL warps to cover ALL 16 rows (each warp has different N slice):
-  //   Each warp owns rows 0..15 × 128 N-cols = 16×128 = 2048 per warp / 32 threads = 64 per thread.
-  //
-  // Let each thread own 16 rows × 4 cols = 64 elements.  Layout:
-  //   lane l owns cols [l*4, l*4+4) in the warp's 128-col slab.  All 16 rows.
-  //   Col global index: warp_id * DV_PER_WARP + lane * 4 + c for c in 0..3.
-  //
-  // Register layout: rO[row][c] where row in 0..15, c in 0..3.
-
+  // Per-thread O register block: 16 rows × 4 cols = 64 floats.
+  // Warp w: owns cols [w*DV_PER_WARP + lane*4 .. +4).
   float rO[B_H][4];
   #pragma unroll
   for (int r = 0; r < B_H; ++r) {
@@ -154,49 +164,46 @@ __global__ void dsa_mla_decode_kernel_v0(
     for (int c = 0; c < 4; ++c) rO[r][c] = 0.f;
   }
 
-  const bf16* q_nope_t = q_nope + t * NUM_HEADS * D_CKV;
-  const bf16* q_pe_t   = q_pe   + t * NUM_HEADS * D_KPE;
-  const int32_t* idx_t = indices + t * TOPK;
+  const bf16*  q_nope_t = q_nope + t * NUM_HEADS * D_CKV;
+  const bf16*  q_pe_t   = q_pe   + t * NUM_HEADS * D_KPE;
+  const int32_t* idx_t  = indices + t * TOPK;
+
   load_q(sQ, q_nope_t, q_pe_t, tid);
   cp_async_commit();
 
-  for (int b = 0; b < NUM_KV_BLOCKS; ++b) {
+  for (int b = blk_start; b < blk_end; ++b) {
     const int32_t* idx_block = idx_t + b * B_TOPK;
     load_k_block(sK, idx_block, ckv, kpe, num_kv, tid);
     cp_async_commit();
     cp_async_wait_all();
     __syncthreads();
 
-    // -------- QK^T: naive FMA.  Warp w computes S[:, w*16 .. (w+1)*16]. --------
-    // 16 rows (heads) × 16 kv-cols / 32 threads = 8 elements per thread.
-    // Partition: lane owns (row = lane%16) × (col = lane/16)*8 + c for c in 0..7.  So 8 elts/thread.
-    // Then 4 warps × 16 cols = 64 cols total ✓.
+    // QK^T: warp w computes S[:, w*16 : w*16+16].
     {
       const int row = lane % 16;
-      const int col_base = (lane / 16) * 8;  // 0 or 8
+      const int col_base = (lane / 16) * 8;
       #pragma unroll
       for (int c = 0; c < 8; ++c) {
         int kv_row = warp_id * 16 + col_base + c;
         float acc = 0.f;
         #pragma unroll
         for (int k = 0; k < D_QK; k += 8) {
-          // 8 bf16 fmas
           bf162 q0 = *reinterpret_cast<bf162*>(&sQ[row * D_QK + k]);
           bf162 q1 = *reinterpret_cast<bf162*>(&sQ[row * D_QK + k + 2]);
           bf162 q2 = *reinterpret_cast<bf162*>(&sQ[row * D_QK + k + 4]);
           bf162 q3 = *reinterpret_cast<bf162*>(&sQ[row * D_QK + k + 6]);
-          bf162 kk0 = *reinterpret_cast<bf162*>(&sK[kv_row * D_QK + k]);
-          bf162 kk1 = *reinterpret_cast<bf162*>(&sK[kv_row * D_QK + k + 2]);
-          bf162 kk2 = *reinterpret_cast<bf162*>(&sK[kv_row * D_QK + k + 4]);
-          bf162 kk3 = *reinterpret_cast<bf162*>(&sK[kv_row * D_QK + k + 6]);
+          bf162 k0 = *reinterpret_cast<bf162*>(&sK[kv_row * D_QK + k]);
+          bf162 k1 = *reinterpret_cast<bf162*>(&sK[kv_row * D_QK + k + 2]);
+          bf162 k2 = *reinterpret_cast<bf162*>(&sK[kv_row * D_QK + k + 4]);
+          bf162 k3 = *reinterpret_cast<bf162*>(&sK[kv_row * D_QK + k + 6]);
           float2 q0f = __bfloat1622float2(q0);
           float2 q1f = __bfloat1622float2(q1);
           float2 q2f = __bfloat1622float2(q2);
           float2 q3f = __bfloat1622float2(q3);
-          float2 k0f = __bfloat1622float2(kk0);
-          float2 k1f = __bfloat1622float2(kk1);
-          float2 k2f = __bfloat1622float2(kk2);
-          float2 k3f = __bfloat1622float2(kk3);
+          float2 k0f = __bfloat1622float2(k0);
+          float2 k1f = __bfloat1622float2(k1);
+          float2 k2f = __bfloat1622float2(k2);
+          float2 k3f = __bfloat1622float2(k3);
           acc += q0f.x * k0f.x + q0f.y * k0f.y
                + q1f.x * k1f.x + q1f.y * k1f.y
                + q2f.x * k2f.x + q2f.y * k2f.y
@@ -207,8 +214,7 @@ __global__ void dsa_mla_decode_kernel_v0(
     }
     __syncthreads();
 
-    // -------- Online softmax on sS, build sP (bf16) --------
-    // warp 0, 16 lanes (0..15) each handle one row.
+    // Online softmax + sP (single warp does all 16 rows; fast enough).
     __shared__ float scale_o_bcast[B_H];
     if (warp_id == 0 && lane < B_H) {
       int r = lane;
@@ -236,22 +242,17 @@ __global__ void dsa_mla_decode_kernel_v0(
     }
     __syncthreads();
 
-    // Rescale all rows of rO by scale_o_bcast[row]
-    {
-      const int row_per_thread = B_H;
+    // Rescale rO
+    #pragma unroll
+    for (int r = 0; r < B_H; ++r) {
+      float so = scale_o_bcast[r];
       #pragma unroll
-      for (int r = 0; r < B_H; ++r) {
-        float so = scale_o_bcast[r];
-        #pragma unroll
-        for (int c = 0; c < 4; ++c) rO[r][c] *= so;
-      }
-      (void)row_per_thread;
+      for (int c = 0; c < 4; ++c) rO[r][c] *= so;
     }
 
-    // -------- PV: O[row, col] += sum_k P[row, k] * V[k, col] --------
-    // Warp w owns N cols: warp_id * DV_PER_WARP + lane*4 + c, for c in 0..3, all 16 rows.
+    // PV: O[row, col] += sum_k P[row, k] * V[k, col]
     {
-      const int col_base_warp = warp_id * DV_PER_WARP + lane * 4;  // 0..124 within d_v
+      const int col_base_warp = warp_id * DV_PER_WARP + lane * 4;
       #pragma unroll
       for (int r = 0; r < B_H; ++r) {
         float acc0 = rO[r][0], acc1 = rO[r][1], acc2 = rO[r][2], acc3 = rO[r][3];
@@ -273,24 +274,168 @@ __global__ void dsa_mla_decode_kernel_v0(
     __syncthreads();
   }
 
-  // -------- Epilogue --------
-  bf16* out_t = output + t * NUM_HEADS * D_V;
-  const int col_base_warp = warp_id * DV_PER_WARP + lane * 4;
-  #pragma unroll
-  for (int r = 0; r < B_H; ++r) {
-    float inv = (rowsum_s[r] == 0.f) ? 0.f : 1.f / rowsum_s[r];
-    bf162 lo = __floats2bfloat162_rn(rO[r][0] * inv, rO[r][1] * inv);
-    bf162 hi = __floats2bfloat162_rn(rO[r][2] * inv, rO[r][3] * inv);
-    *reinterpret_cast<bf162*>(&out_t[r * D_V + col_base_warp])     = lo;
-    *reinterpret_cast<bf162*>(&out_t[r * D_V + col_base_warp + 2]) = hi;
+  // ---- Epilogue ----
+  if (num_splits == 1) {
+    bf16* out_t = final_out + t * NUM_HEADS * D_V;
+    const int col_base_warp = warp_id * DV_PER_WARP + lane * 4;
+    #pragma unroll
+    for (int r = 0; r < B_H; ++r) {
+      float inv = (rowsum_s[r] == 0.f) ? 0.f : 1.f / rowsum_s[r];
+      bf162 lo = __floats2bfloat162_rn(rO[r][0] * inv, rO[r][1] * inv);
+      bf162 hi = __floats2bfloat162_rn(rO[r][2] * inv, rO[r][3] * inv);
+      *reinterpret_cast<bf162*>(&out_t[r * D_V + col_base_warp])     = lo;
+      *reinterpret_cast<bf162*>(&out_t[r * D_V + col_base_warp + 2]) = hi;
+    }
+    if (warp_id == 0 && lane < B_H) {
+      float s = rowsum_s[lane];
+      float m = rowmax_s[lane];
+      float v = (m == -INFINITY || s == 0.f) ? -INFINITY : (log2f(s) + m);
+      final_lse[t * NUM_HEADS + lane] = v;
+    }
+  } else {
+    // Write *normalized* o_accum (rO / rowsum) and lse_accum = log2(rowsum) + rowmax.
+    // Combine kernel weights each split by 2^{lse_s - global_max}, sums normalized O, divides.
+    float* o_t = o_accum + ((int64_t)split * num_tokens + t) * NUM_HEADS * D_V;
+    float* l_t = lse_accum + ((int64_t)split * num_tokens + t) * NUM_HEADS;
+    const int col_base_warp = warp_id * DV_PER_WARP + lane * 4;
+    #pragma unroll
+    for (int r = 0; r < B_H; ++r) {
+      const float rs = rowsum_s[r];
+      const float inv = (rs == 0.f) ? 0.f : (1.f / rs);
+      o_t[r * D_V + col_base_warp    ] = rO[r][0] * inv;
+      o_t[r * D_V + col_base_warp + 1] = rO[r][1] * inv;
+      o_t[r * D_V + col_base_warp + 2] = rO[r][2] * inv;
+      o_t[r * D_V + col_base_warp + 3] = rO[r][3] * inv;
+    }
+    if (warp_id == 0 && lane < B_H) {
+      float s = rowsum_s[lane];
+      float m = rowmax_s[lane];
+      l_t[lane] = (m == -INFINITY || s == 0.f) ? -INFINITY : (log2f(s) + m);
+    }
+  }
+}
+
+// ---------------- combine kernel ----------------
+// Merges per-split (o_accum, lse_accum) into final (output, lse) via log-sum-exp reduction.
+//
+// Each CTA handles one (token, head) pair.  NUM_HEADS=16 tokens=Ntok → Ntok*16 blocks.
+//
+// For a single head:
+//   lse_final = log2(sum_s 2^{lse_accum[s] - max_lse})  +  max_lse
+//   out_final = sum_s o_accum[s] * 2^{lse_accum[s] - max_lse_noscale}   (where noscale = used row-max)
+//   actually: o_accum[s] is already un-normalized (raw softmaxed * V, not divided by rowsum).
+//   rowsum_for_split_s = exp2(lse_accum[s] - (log2(rowsum_s) + max_s))
+//   Hmm — simpler to think in full terms:
+//     lse_accum[s] = log2(sum_j exp2(logit - max))+ max  → equivalent to log2(unnormalized_denom) + max
+//       where unnormalized_denom = sum exp(logit * ln2) = sum exp2(logit - max) * 2^max ≈ sum*2^max
+//
+//   We have per-split:
+//     rowsum_s[split]  = sum_j exp2(logit_scaled_j - local_max_s)
+//     rowmax_s[split]  = local_max_s
+//     o_accum[split]   = sum_j exp2(logit_j - local_max_s) * V[j]    (unnormalized by rowsum)
+//
+//   And we saved lse_s = log2(rowsum_s) + local_max_s.
+//
+//   Combine across splits:
+//     global_max = max_s(local_max_s)
+//     w_s = 2^{local_max_s - global_max}
+//     global_sum = sum_s (rowsum_s * w_s)  =  sum_s 2^{lse_s - global_max}
+//     o_final_unnorm = sum_s (o_accum[s] * w_s)
+//     o_final = o_final_unnorm / global_sum
+//     lse_final = log2(global_sum) + global_max
+//
+// Since lse_s = log2(rowsum_s) + local_max_s = log2(rowsum_s * 2^local_max_s),
+// 2^{lse_s - global_max} = rowsum_s * 2^{local_max_s - global_max} = rowsum_s * w_s.
+//
+// And o_accum[s] is unnormalized (before dividing by rowsum_s), so
+// (o_accum[s] * w_s) has the same weighting as rowsum_s * w_s.  Good.
+
+__global__ void dsa_mla_combine_kernel(
+    const float* __restrict__ o_accum,    // [S, T, H, D_V]
+    const float* __restrict__ lse_accum,  // [S, T, H]
+    bf16*       __restrict__ output,       // [T, H, D_V]
+    float*      __restrict__ lse,          // [T, H]
+    int32_t num_splits,
+    int32_t num_tokens)
+{
+  const int th = blockIdx.x;
+  const int t = th / NUM_HEADS;
+  const int h = th % NUM_HEADS;
+  if (t >= num_tokens) return;
+
+  const int tid = threadIdx.x;
+  constexpr int CTA = 128;  // 1 CTA of 128 threads, each handles D_V/128 = 4 cols.
+
+  // Step 1: global_max over splits.
+  float gmax = -INFINITY;
+  for (int s = 0; s < num_splits; ++s) {
+    float lv = lse_accum[(int64_t)s * num_tokens * NUM_HEADS + t * NUM_HEADS + h];
+    gmax = fmaxf(gmax, lv);
   }
 
-  if (warp_id == 0 && lane < B_H) {
-    float s = rowsum_s[lane];
-    float m = rowmax_s[lane];
-    float v = (m == -INFINITY || s == 0.f) ? -INFINITY : (log2f(s) + m);
-    lse_out[t * NUM_HEADS + lane] = v;
+  // Step 2: per-split w_s = 2^{lse_s - gmax}, global_sum.
+  float gsum = 0.f;
+  for (int s = 0; s < num_splits; ++s) {
+    float lv = lse_accum[(int64_t)s * num_tokens * NUM_HEADS + t * NUM_HEADS + h];
+    if (lv != -INFINITY) {
+      gsum += exp2f(lv - gmax);
+    }
   }
+
+  // Step 3: per col_group, accumulate o.
+  // Each thread handles D_V/CTA = 4 consecutive cols.
+  const int col_base = tid * 4;
+  float4 acc = {0.f, 0.f, 0.f, 0.f};
+  for (int s = 0; s < num_splits; ++s) {
+    float lv = lse_accum[(int64_t)s * num_tokens * NUM_HEADS + t * NUM_HEADS + h];
+    if (lv == -INFINITY) continue;
+    // w = 2^{lv - gmax}  — but lv = log2(rowsum_s) + local_max_s, so
+    // w = rowsum_s * 2^{local_max_s - gmax}.  o_accum has the *unnormalized* running sum
+    // sum_j exp2(logit - local_max_s) * V = (rowsum_s-weighted).
+    // Net: o_final unnormalized contribution = o_accum * 2^{local_max_s - gmax}.
+    // We only stored lv = log2(rowsum_s) + local_max_s, not local_max_s alone.  But we can
+    // recover exp2(local_max_s - gmax) = exp2(lv - gmax) / rowsum_s.  Hmm, we don't have rowsum.
+    //
+    // Alternative: don't store the raw unnormalized o_accum.  Store normalized o_accum/rowsum
+    // instead.  Then o_final = sum_s (o_accum_norm * 2^{lv - gmax}) / sum_s 2^{lv - gmax}.
+    //
+    // That's much simpler if the split kernel NORMALIZES o_accum before writing.
+    // So I'll change the split kernel to write o_accum = rO / rowsum_s.
+    const float w = exp2f(lv - gmax);
+    const float* o_t = o_accum + ((int64_t)s * num_tokens + t) * NUM_HEADS * D_V + h * D_V;
+    float4 a = *reinterpret_cast<const float4*>(&o_t[col_base]);
+    acc.x += a.x * w;
+    acc.y += a.y * w;
+    acc.z += a.z * w;
+    acc.w += a.w * w;
+  }
+  const float inv_gsum = (gsum == 0.f) ? 0.f : (1.f / gsum);
+  acc.x *= inv_gsum;
+  acc.y *= inv_gsum;
+  acc.z *= inv_gsum;
+  acc.w *= inv_gsum;
+
+  bf16* out_p = output + t * NUM_HEADS * D_V + h * D_V + col_base;
+  bf162 lo = __floats2bfloat162_rn(acc.x, acc.y);
+  bf162 hi = __floats2bfloat162_rn(acc.z, acc.w);
+  *reinterpret_cast<bf162*>(out_p    ) = lo;
+  *reinterpret_cast<bf162*>(out_p + 2) = hi;
+
+  if (tid == 0) {
+    float v = (gmax == -INFINITY || gsum == 0.f) ? -INFINITY : (log2f(gsum) + gmax);
+    lse[t * NUM_HEADS + h] = v;
+  }
+}
+
+// Choose num_splits — return a divisor of NUM_KV_BLOCKS (=32) bounded by SM count.
+__host__ inline int choose_num_splits(int num_tokens, int num_sms) {
+  int want = (num_sms + num_tokens - 1) / num_tokens;   // CTAs per token
+  // Round down to the nearest divisor of NUM_KV_BLOCKS in {32,16,8,4,2,1}.
+  int candidates[] = {32, 16, 8, 4, 2, 1};
+  for (int c : candidates) {
+    if (c <= want) return c;
+  }
+  return 1;
 }
 
 }  // namespace dsa_mla_ns
@@ -325,14 +470,19 @@ void dsa_mla_decode(
   const int32_t num_kv_tokens = num_pages * PAGE_SIZE;
   const DLDevice device = dev_.unwrap();
   const cudaStream_t stream = LaunchKernel::resolve_device(device);
-
   if (num_tokens == 0) return;
+
+  int sm_count = 0;
+  cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device.device_id);
+  if (sm_count <= 0) sm_count = 148;
+
+  const int num_splits = choose_num_splits(num_tokens, sm_count);
 
   constexpr size_t smem_bytes = SmemLayout::TOTAL;
   static bool attr_set = false;
   if (!attr_set) {
     cudaFuncSetAttribute(
-        (const void*)dsa_mla_decode_kernel_v0,
+        (const void*)dsa_mla_decode_split_kernel,
         cudaFuncAttributeMaxDynamicSharedMemorySize,
         static_cast<int>(smem_bytes));
     attr_set = true;
@@ -340,15 +490,52 @@ void dsa_mla_decode(
 
   const float sm_scale_log2 = static_cast<float>(sm_scale) * 1.4426950408889634f;
 
-  dim3 grid(num_tokens);
-  dim3 block(NUM_THREADS);
-  dsa_mla_decode_kernel_v0<<<grid, block, smem_bytes, stream>>>(
-      static_cast<const bf16*>(q_nope.data_ptr()),
-      static_cast<const bf16*>(q_pe.data_ptr()),
-      static_cast<const bf16*>(ckv_cache.data_ptr()),
-      static_cast<const bf16*>(kpe_cache.data_ptr()),
-      static_cast<const int32_t*>(sparse_indices.data_ptr()),
-      static_cast<bf16*>(output.data_ptr()),
-      static_cast<float*>(lse.data_ptr()),
-      num_tokens, num_kv_tokens, sm_scale_log2);
+  if (num_splits == 1) {
+    dim3 grid(num_tokens);
+    dim3 block(NUM_THREADS);
+    dsa_mla_decode_split_kernel<<<grid, block, smem_bytes, stream>>>(
+        static_cast<const bf16*>(q_nope.data_ptr()),
+        static_cast<const bf16*>(q_pe.data_ptr()),
+        static_cast<const bf16*>(ckv_cache.data_ptr()),
+        static_cast<const bf16*>(kpe_cache.data_ptr()),
+        static_cast<const int32_t*>(sparse_indices.data_ptr()),
+        nullptr, nullptr,
+        static_cast<bf16*>(output.data_ptr()),
+        static_cast<float*>(lse.data_ptr()),
+        num_tokens, num_kv_tokens, 1, sm_scale_log2);
+  } else {
+    // Allocate scratch via thrust/torch allocator is not readily available here; use per-call
+    // cudaMalloc (will be cached by the allocator).  For correctness we go with plain malloc on
+    // the device side first; real path should reuse a workspace.
+    // NB: this path is NOT zero-overhead; we'll replace with a workspace in a follow-up.
+    size_t o_bytes   = (size_t)num_splits * num_tokens * NUM_HEADS * D_V * sizeof(float);
+    size_t lse_bytes = (size_t)num_splits * num_tokens * NUM_HEADS     * sizeof(float);
+    float* o_accum = nullptr;
+    float* lse_accum = nullptr;
+    cudaMallocAsync((void**)&o_accum, o_bytes, stream);
+    cudaMallocAsync((void**)&lse_accum, lse_bytes, stream);
+
+    dim3 grid(num_tokens * num_splits);
+    dim3 block(NUM_THREADS);
+    dsa_mla_decode_split_kernel<<<grid, block, smem_bytes, stream>>>(
+        static_cast<const bf16*>(q_nope.data_ptr()),
+        static_cast<const bf16*>(q_pe.data_ptr()),
+        static_cast<const bf16*>(ckv_cache.data_ptr()),
+        static_cast<const bf16*>(kpe_cache.data_ptr()),
+        static_cast<const int32_t*>(sparse_indices.data_ptr()),
+        o_accum, lse_accum,
+        nullptr, nullptr,
+        num_tokens, num_kv_tokens, num_splits, sm_scale_log2);
+
+    dim3 cgrid(num_tokens * NUM_HEADS);
+    dim3 cblk(D_V / 4);   // 128 threads × 4 cols
+    dsa_mla_combine_kernel<<<cgrid, cblk, 0, stream>>>(
+        o_accum, lse_accum,
+        static_cast<bf16*>(output.data_ptr()),
+        static_cast<float*>(lse.data_ptr()),
+        num_splits, num_tokens);
+
+    cudaFreeAsync(o_accum, stream);
+    cudaFreeAsync(lse_accum, stream);
+  }
 }
