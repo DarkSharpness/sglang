@@ -114,7 +114,7 @@ __device__ __forceinline__ void load_k_block(
 //
 // If num_splits == 1 we write straight to the final output instead of accum.
 
-__launch_bounds__(NUM_THREADS, 1)
+__launch_bounds__(NUM_THREADS, 2)
 __global__ void dsa_mla_decode_split_kernel(
     const bf16* q_nope,       // [T, 16, 512]
     const bf16* q_pe,         // [T, 16, 64]
@@ -181,7 +181,8 @@ __global__ void dsa_mla_decode_split_kernel(
     __syncthreads();
 
     // QK^T: warp w computes S[:, w*16 : w*16+16].
-    // ILP-friendly version: 8 independent accumulators (one per output col) updated in parallel.
+    // ILP-friendly: 8 independent accumulators (one per output col) updated in parallel.
+    // Keep inner 8-way c-unroll, but NO k-unroll (code-size / I-cache friendly).
     {
       const int row = lane % 16;
       const int col_base = (lane / 16) * 8;
@@ -189,9 +190,7 @@ __global__ void dsa_mla_decode_split_kernel(
       float acc[8];
       #pragma unroll
       for (int c = 0; c < 8; ++c) acc[c] = 0.f;
-      #pragma unroll 2
       for (int k = 0; k < D_QK; k += 8) {
-        // Preload q once per k-step.
         bf162 q0 = *reinterpret_cast<bf162*>(&sQ[row * D_QK + k]);
         bf162 q1 = *reinterpret_cast<bf162*>(&sQ[row * D_QK + k + 2]);
         bf162 q2 = *reinterpret_cast<bf162*>(&sQ[row * D_QK + k + 4]);
@@ -261,12 +260,11 @@ __global__ void dsa_mla_decode_split_kernel(
     }
 
     // PV: O[row, col] += sum_k P[row, k] * V[k, col]
+    // Do not unroll the r loop (16 rows = too big for I$).  Keep inner k serial.
     {
       const int col_base_warp = warp_id * DV_PER_WARP + lane * 4;
-      #pragma unroll
       for (int r = 0; r < B_H; ++r) {
         float acc0 = rO[r][0], acc1 = rO[r][1], acc2 = rO[r][2], acc3 = rO[r][3];
-        #pragma unroll
         for (int k = 0; k < B_TOPK; ++k) {
           float p = __bfloat162float(sP[r * B_TOPK + k]);
           bf162 v01 = *reinterpret_cast<bf162*>(&sK[k * D_QK + col_base_warp]);
