@@ -2,18 +2,74 @@
 
 Target: flashinfer-bench `dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64`.
 
-## Current performance (B200, seqlen=8192)
+## Performance reference (B200, seqlen=8192)
 
-| num_tokens | ours (µs) | flashinfer_trtllm (µs) | speedup |
-|-----------:|----------:|-----------------------:|---------|
-|          1 |        57 |                     80 | **1.41×** |
-|          2 |        57 |                     77 | **1.35×** |
-|          4 |        57 |                     79 | **1.38×** |
-|          6 |        87 |                     78 |   0.90× |
-|          8 |        88 |                     83 |   0.95× |
+Apples-to-apples comparison. All three runners share the public signature
+`run(q_nope, q_pe, ckv, kpe, idx, sm_scale) → (output,)` and ALL preprocessing
+(seq_lens derivation, layout xforms, workspace alloc, q-pad-to-128 for flash_mla)
+runs INSIDE the timed call. Bench source: `bench_dsa_mla_decode.py`.
 
-Primary regime (batch 1–4) is ~35% faster than flashinfer_trtllm. At bs≥6 we fall behind
-because each CTA has to process 2 KV blocks and we don't pipeline across blocks.
+### V3 (scalar FMA, last benchmarked baseline)
+
+| num_tokens | ours (µs) | flash_mla (µs) | official flashinfer (µs) | vs flash_mla |
+|-----------:|----------:|---------------:|-------------------------:|--------------|
+|          1 |        55 |             74 |                       96 | **1.35×**    |
+|          2 |        53 |             72 |                       97 | **1.36×**    |
+|          4 |        54 |             73 |                      100 | **1.37×**    |
+|          6 |        75 |             74 |                       98 |  ≈           |
+|          8 |        76 |             74 |                      102 |  ≈           |
+|         16 |       121 |             74 |                      102 |  0.61×       |
+|         32 |       220 |             75 |                      107 |  0.34×       |
+
+Beat flash_mla up to T=4, matched it through T=8, **scaled linearly above** because
+the scalar bf16 FMA path bottlenecks on per-CTA compute as T grows.
+
+### V4 (tensor core, current — UNTESTED on hardware)
+
+Replaced both QK and PV inner loops with `mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32`
+(NVIDIA mma instruction, available since SM80; on SM100/B200 this dispatches to
+the same tensor-core pipeline FlashMLA's UMMA goes through).
+
+Expected per-block compute drop:
+- QK: 590K scalar FMAs → ~72 mma calls/warp ≈ 0.3 µs/warp (was ~9 µs).
+- PV: 524K scalar FMAs → ~64 mma calls/warp ≈ 0.25 µs/warp (was ~10 µs).
+
+Per block compute drops ~30× and the kernel becomes HBM-gather-bound. Expected
+T=32 wall-clock should approach ~80–100 µs (vs 220 µs scalar). Bench numbers
+will be filled in once the test machine is back; the code currently compiles
+clean against `mma.m16n8k16` semantics but has not been run on hardware.
+
+The flash_mla baseline pads `q` from 16 → 128 heads (Blackwell minimum supported
+by `flash_mla_sparse_fwd`) and slices the output back; this is exactly how
+sglang's `nsa_backend._forward_flashmla_sparse` invokes it for h_q < 128.
+
+## Design summary (V4)
+
+- **Static split-KV scheduler.** `num_splits = largest divisor of NUM_KV_BLOCKS=32`
+  that fits `num_tokens × num_splits ≤ 2 × num_sms`. Targets 2 CTAs/SM
+  occupancy (`__launch_bounds__(NUM_THREADS, 2)`) for cross-CTA load latency
+  hiding. Host-computed; **no preprocessing kernel**.
+- **Compute**: `mma.m16n8k16.row.col.f32.bf16.bf16.f32` for both QK and PV.
+  M=16 fits exactly to `B_H=16` so no Q-padding is needed.
+  - QK: per warp does 2 N-sub-tiles × 36 K-tiles = 72 MMA calls. Both A (sQ)
+    and B (sK transposed-via-row-major) load with simple `.b32` smem reads
+    since sK[n][k] naturally has K-contiguous-per-N layout matching mma.B "col".
+  - PV: per warp does 16 N-sub-tiles × 4 K-tiles = 64 MMA calls. A (sP) is
+    contiguous; B (V = sK[..., 0:512]) needs strided bf16 reads because sV
+    is K-major in our smem but mma.B wants col-layout. Each thread does 4
+    strided 16-bit loads per K-iter, packed into 2 .b32. Less efficient than
+    `ldmatrix.trans` (TODO) but correct without CUTLASS layouts.
+  - Per-thread accumulator `rO[16][4]`: 16 N-sub-tiles × 4 fp32-fragments,
+    same total registers as the previous scalar `[B_H][4]` (64 fp32/thread).
+- **Block**: 128 threads = 4 warps. `B_H = 16`, `B_TOPK = 64`.
+- **Per-CTA smem (~98 KB)**: sQ + sK + sS + sP, single buffer.
+- **Loader**: per-thread `cp.async.cg.shared.global.L2::256B`.
+- **Compute**: scalar FMA loops with 8 independent accumulators (ILP win); no MMA yet.
+- **Combine kernel**: templated on `NUM_SPLITS ∈ {2,4,8,16,32}`. Issues all
+  NUM_SPLITS o_accum loads back-to-back into a register array (memory-level
+  parallelism), then a pure-compute pass does softmax + accumulate.
+- **lse**: optional (signal "skip" by passing a 0-numel tensor); the Python API
+  exposes `dsa_mla_decode_with_lse` for tests.
 
 ## Design summary (V2, current)
 
@@ -46,28 +102,38 @@ because each CTA has to process 2 KV blocks and we don't pipeline across blocks.
 
 ## Things we didn't do but would help
 
-### (A) Tensor core (UMMA / mma.m16n8k16)
+### (A) Tensor core (mma.m16n8k16) — IMPLEMENTED in V4
 
-Single biggest unexplored win. Current compute budget per B_TOPK block:
+Both QK and PV inner loops now use `mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32`
+(see `mma_m16n8k16_bf16_f32` helper). M=16 fits exactly to `B_H=16`, so no padding.
 
-- QK: 16 × 64 × 576 = 589 824 scalar FMAs
-- PV: 16 × 512 × 64 = 524 288 scalar FMAs
+QK is the clean case: sQ row-major fits mma.A "row"; sK[n][k] (K-major) naturally
+matches mma.B "col" since fixed-n + varying-k is contiguous in our smem.
 
-Total ≈ 1.1 M FMAs per block. With `mma.m16n8k16` (M=16 fits exactly — no padding
-needed for h_q=16), this drops to ≈ 32 UMMA calls per block. Expected speedup: 5–10×
-on the compute part, which is currently ~50% of kernel time (the rest is HBM gather
-latency).
+PV is awkward: V is sK[..., 0:512] with K-major layout, but mma.B "col" wants
+N-outer in memory. The current implementation does 4 strided bf16 reads per
+thread per (k_iter, n_sub) and packs into 2 .b32. This works but leaves perf
+on the table due to bank contention. Follow-up: use `ldmatrix.x2.trans` to do
+the transposed load in hardware (FlashMLA's path via `SmemLayoutKTilesTransposed_SW128`).
 
-Attempted in an early commit but had an ldmatrix→mma register mapping bug; reverted
-to keep correctness progress. Re-introducing it requires a careful isolated test of
-each 16×16 fragment load before plumbing in.
+**This change has not been tested on real hardware** — the dev box was down at
+the time of writing. The next session should:
+1. Run the existing test suite (`tests/dsa_mla/test_dsa_mla_decode.py`).
+2. Run `bench_dsa_mla_decode.py` and compare against V3 numbers above.
+3. If correctness fails, inspect the per-thread mma fragment layout (the
+   per-thread layout comments next to `mma_m16n8k16_bf16_f32` are the spec).
 
 ### (B) Double-buffered K loads
 
-At bs=6,8 each CTA processes 2 KV blocks sequentially → each load serialises with its
-compute. Double-buffering (167 KB smem) would hide one load behind compute, cutting
-the bs=8 time from 88 → ~65 µs. Attempt regressed at bs=1 (no multi-iter to overlap);
-needs a guard to only enable when `blk_end - blk_start >= 2`.
+Tried with NUM_BUFS=2 (FlashMLA-style ring buffer): the 2× K smem (146 KB) blows
+past the 2-CTA/SM budget so we drop to 1 CTA/SM — which loses the cross-CTA load
+hiding that the 2-CTA/SM packing currently buys (~10 µs at low T, ~50 µs at T=8).
+Net regression of 13–22 µs across the board. The ~15 µs we'd save by hiding K
+load behind compute is less than what we lose to halved occupancy.
+
+To make this win, would need to reduce K smem (smaller B_TOPK, or split K into
+NoPE/RoPE halves and only double-buffer NoPE). Or use cluster mode (C) to share
+the buffer between 2 CTAs.
 
 ### (C) 2-CTA cluster cooperative gather
 

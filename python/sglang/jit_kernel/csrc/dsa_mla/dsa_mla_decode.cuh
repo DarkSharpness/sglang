@@ -55,6 +55,29 @@ __device__ __forceinline__ void cp_async_16_pred(void* smem_dst, const void* gme
 }
 __device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;\n" ::); }
 __device__ __forceinline__ void cp_async_wait_all() { asm volatile("cp.async.wait_all;\n" ::); }
+template <int N>
+__device__ __forceinline__ void cp_async_wait_group() { asm volatile("cp.async.wait_group %0;\n" :: "n"(N)); }
+
+// Tensor core MMA helper. mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32:
+//   D[M=16, N=8] += A[M=16, K=16] × B[K=16, N=8]   (B in col layout)
+// Per-thread fragment layout (lane t = threadIdx.x % 32):
+//   A (4 .b32 / 8 bf16): rows {t/4, t/4+8}, cols {(t%4)*4..(t%4)*4+3}
+//   B (2 .b32 / 4 bf16): col {t/4},          rows {(t%4)*4..(t%4)*4+3}
+//   D (4 fp32):           rows {t/4, t/4+8}, cols {2*(t%4), 2*(t%4)+1}
+__device__ __forceinline__ void mma_m16n8k16_bf16_f32(
+    float& d0, float& d1, float& d2, float& d3,
+    uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+    uint32_t b0, uint32_t b1) {
+  asm volatile(
+      "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+      "{%0, %1, %2, %3}, "
+      "{%4, %5, %6, %7}, "
+      "{%8, %9}, "
+      "{%0, %1, %2, %3};\n"
+      : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)
+      : "r"(a0), "r"(a1), "r"(a2), "r"(a3),
+        "r"(b0), "r"(b1));
+}
 
 // D_QK=576 means per-row byte stride = 1152 B = 288 × 4B banks.  288 % 32 = 0, so threads
 // accessing the same col across rows hit the same bank — 16-way conflict in QK.
@@ -164,13 +187,14 @@ __global__ void dsa_mla_decode_split_kernel(
   __shared__ float rowsum_s[B_H];
   if (tid < B_H) { rowmax_s[tid] = -INFINITY; rowsum_s[tid] = 0.f; }
 
-  // Per-thread O register block: 16 rows × 4 cols = 64 floats.
-  // Warp w: owns cols [w*DV_PER_WARP + lane*4 .. +4).
-  float rO[B_H][4];
+  // Per-thread O register block: 16 N-sub-tiles × 4 fp32 (mma D layout) = 64 floats.
+  // Warp w owns DV_PER_WARP=128 D_V cols across its 16 N-sub-tiles. Per thread,
+  // each rO[n_sub] holds a 2x2 fragment: rows {lane/4, lane/4+8}, cols {2*(lane%4), +1}.
+  float rO[16][4];
   #pragma unroll
-  for (int r = 0; r < B_H; ++r) {
+  for (int n_sub = 0; n_sub < 16; ++n_sub) {
     #pragma unroll
-    for (int c = 0; c < 4; ++c) rO[r][c] = 0.f;
+    for (int c = 0; c < 4; ++c) rO[n_sub][c] = 0.f;
   }
 
   const bf16*  q_nope_t = q_nope + t * NUM_HEADS * D_CKV;
@@ -186,46 +210,59 @@ __global__ void dsa_mla_decode_split_kernel(
     cp_async_commit();
     cp_async_wait_all();
     __syncthreads();
+    bf16* sKb = sK;
 
-    // QK^T: warp w computes S[:, w*16 : w*16+16].
-    // ILP-friendly: 8 independent accumulators (one per output col) updated in parallel.
-    // Keep inner 8-way c-unroll, but NO k-unroll (code-size / I-cache friendly).
+    // QK^T via tensor cores. Each warp computes a M=16 × N=16 slice of S, with
+    // N partitioned across the 4 warps. Per warp we split N=16 into 2 mma N-tiles
+    // (each N=8) and walk K=576 in 36 K-tiles of K=16, accumulating into a per-
+    // thread D[2 N-sub][4 fp32] register block.
+    //
+    //   A = sQ tile [16, K=16]  — row-major, mma.A "row" layout fits directly.
+    //   B = K^T tile [K=16, N=8] — sK[n][k] is naturally K-contiguous-per-N → fits
+    //                              mma.B "col" layout with no transpose needed.
     {
-      const int row = lane % 16;
-      const int col_base = (lane / 16) * 8;
-      int kv_row_base = warp_id * 16 + col_base;
-      float acc[8];
+      const int row_t  = lane / 4;          // 0..7
+      const int col_t  = (lane % 4) * 4;    // 0,4,8,12 (K-offset within tile)
+      const int dcol_t = (lane % 4) * 2;    // D-col offset within an N-sub-tile
+      const int warp_n_base = warp_id * 16;
+
+      float D[2][4];
       #pragma unroll
-      for (int c = 0; c < 8; ++c) acc[c] = 0.f;
-      for (int k = 0; k < D_QK; k += 8) {
-        bf162 q0 = *reinterpret_cast<bf162*>(&sQ[row * STRIDE_QK_BF16 + k]);
-        bf162 q1 = *reinterpret_cast<bf162*>(&sQ[row * STRIDE_QK_BF16 + k + 2]);
-        bf162 q2 = *reinterpret_cast<bf162*>(&sQ[row * STRIDE_QK_BF16 + k + 4]);
-        bf162 q3 = *reinterpret_cast<bf162*>(&sQ[row * STRIDE_QK_BF16 + k + 6]);
-        float2 q0f = __bfloat1622float2(q0);
-        float2 q1f = __bfloat1622float2(q1);
-        float2 q2f = __bfloat1622float2(q2);
-        float2 q3f = __bfloat1622float2(q3);
+      for (int i = 0; i < 2; ++i) {
+        D[i][0] = D[i][1] = D[i][2] = D[i][3] = 0.f;
+      }
+
+      for (int k_base = 0; k_base < D_QK; k_base += 16) {
+        // A: rows {row_t, row_t+8} of sQ at cols [k_base+col_t .. +col_t+3].
+        uint32_t a0 = *reinterpret_cast<const uint32_t*>(
+            &sQ[row_t       * STRIDE_QK_BF16 + k_base + col_t + 0]);
+        uint32_t a1 = *reinterpret_cast<const uint32_t*>(
+            &sQ[row_t       * STRIDE_QK_BF16 + k_base + col_t + 2]);
+        uint32_t a2 = *reinterpret_cast<const uint32_t*>(
+            &sQ[(row_t + 8) * STRIDE_QK_BF16 + k_base + col_t + 0]);
+        uint32_t a3 = *reinterpret_cast<const uint32_t*>(
+            &sQ[(row_t + 8) * STRIDE_QK_BF16 + k_base + col_t + 2]);
+
         #pragma unroll
-        for (int c = 0; c < 8; ++c) {
-          int kv_row = kv_row_base + c;
-          bf162 k0 = *reinterpret_cast<bf162*>(&sK[kv_row * STRIDE_QK_BF16 + k]);
-          bf162 k1 = *reinterpret_cast<bf162*>(&sK[kv_row * STRIDE_QK_BF16 + k + 2]);
-          bf162 k2 = *reinterpret_cast<bf162*>(&sK[kv_row * STRIDE_QK_BF16 + k + 4]);
-          bf162 k3 = *reinterpret_cast<bf162*>(&sK[kv_row * STRIDE_QK_BF16 + k + 6]);
-          float2 k0f = __bfloat1622float2(k0);
-          float2 k1f = __bfloat1622float2(k1);
-          float2 k2f = __bfloat1622float2(k2);
-          float2 k3f = __bfloat1622float2(k3);
-          acc[c] += q0f.x * k0f.x + q0f.y * k0f.y
-                  + q1f.x * k1f.x + q1f.y * k1f.y
-                  + q2f.x * k2f.x + q2f.y * k2f.y
-                  + q3f.x * k3f.x + q3f.y * k3f.y;
+        for (int n_sub = 0; n_sub < 2; ++n_sub) {
+          const int n_local = warp_n_base + n_sub * 8 + row_t;  // mma.B col index
+          uint32_t b0 = *reinterpret_cast<const uint32_t*>(
+              &sKb[n_local * STRIDE_QK_BF16 + k_base + col_t + 0]);
+          uint32_t b1 = *reinterpret_cast<const uint32_t*>(
+              &sKb[n_local * STRIDE_QK_BF16 + k_base + col_t + 2]);
+          mma_m16n8k16_bf16_f32(D[n_sub][0], D[n_sub][1], D[n_sub][2], D[n_sub][3],
+                                a0, a1, a2, a3, b0, b1);
         }
       }
+
+      // Spill D fragments to sS (which the softmax warp will read row-major).
       #pragma unroll
-      for (int c = 0; c < 8; ++c) {
-        sS[row * B_TOPK + kv_row_base + c] = acc[c];
+      for (int n_sub = 0; n_sub < 2; ++n_sub) {
+        const int col_base_d = warp_n_base + n_sub * 8 + dcol_t;
+        sS[ row_t      * B_TOPK + col_base_d + 0] = D[n_sub][0];
+        sS[ row_t      * B_TOPK + col_base_d + 1] = D[n_sub][1];
+        sS[(row_t + 8) * B_TOPK + col_base_d + 0] = D[n_sub][2];
+        sS[(row_t + 8) * B_TOPK + col_base_d + 1] = D[n_sub][3];
       }
     }
     __syncthreads();
@@ -258,193 +295,206 @@ __global__ void dsa_mla_decode_split_kernel(
     }
     __syncthreads();
 
-    // Rescale rO
-    #pragma unroll
-    for (int r = 0; r < B_H; ++r) {
-      float so = scale_o_bcast[r];
+    // Rescale rO. With tensor-core layout, rO[n_sub][0..1] correspond to row =
+    // (lane/4) and rO[n_sub][2..3] to row = (lane/4)+8 — so a single broadcast
+    // pair per thread covers all 16 N-sub-tiles.
+    {
+      const int row_t = lane / 4;
+      const float so0 = scale_o_bcast[row_t];
+      const float so1 = scale_o_bcast[row_t + 8];
       #pragma unroll
-      for (int c = 0; c < 4; ++c) rO[r][c] *= so;
+      for (int n_sub = 0; n_sub < 16; ++n_sub) {
+        rO[n_sub][0] *= so0;
+        rO[n_sub][1] *= so0;
+        rO[n_sub][2] *= so1;
+        rO[n_sub][3] *= so1;
+      }
     }
 
-    // PV: O[row, col] += sum_k P[row, k] * V[k, col]
-    // Do not unroll the r loop (16 rows = too big for I$).  Keep inner k serial.
+    // PV via tensor cores. Each warp owns N = [warp_id*128, +128) of the output.
+    // We split N=128 into 16 mma N-sub-tiles (each N=8) and walk K=64 in 4 K-tiles.
+    //
+    //   A = sP tile [16, K=16] — row-major, mma.A "row" fits directly.
+    //   B = V tile [K=16, N=8] — V is sKb[k][n] (K-major in our smem). mma.B
+    //     wants col-layout (N-outer in memory), so each thread reads 4 strided
+    //     bf16 values along K at one fixed N column. Not as efficient as
+    //     ldmatrix.trans but stays within plain PTX and avoids extra smem.
     {
-      const int col_base_warp = warp_id * DV_PER_WARP + lane * 4;
-      for (int r = 0; r < B_H; ++r) {
-        float acc0 = rO[r][0], acc1 = rO[r][1], acc2 = rO[r][2], acc3 = rO[r][3];
-        for (int k = 0; k < B_TOPK; ++k) {
-          float p = __bfloat162float(sP[r * B_TOPK + k]);
-          bf162 v01 = *reinterpret_cast<bf162*>(&sK[k * STRIDE_QK_BF16 + col_base_warp]);
-          bf162 v23 = *reinterpret_cast<bf162*>(&sK[k * STRIDE_QK_BF16 + col_base_warp + 2]);
-          float2 v01f = __bfloat1622float2(v01);
-          float2 v23f = __bfloat1622float2(v23);
-          acc0 += p * v01f.x;
-          acc1 += p * v01f.y;
-          acc2 += p * v23f.x;
-          acc3 += p * v23f.y;
+      const int row_t  = lane / 4;
+      const int col_t  = (lane % 4) * 4;
+      const int warp_n_base = warp_id * DV_PER_WARP;  // 128 cols per warp
+
+      #pragma unroll 1
+      for (int k_base = 0; k_base < B_TOPK; k_base += 16) {
+        uint32_t a0 = *reinterpret_cast<const uint32_t*>(
+            &sP[row_t       * B_TOPK + k_base + col_t + 0]);
+        uint32_t a1 = *reinterpret_cast<const uint32_t*>(
+            &sP[row_t       * B_TOPK + k_base + col_t + 2]);
+        uint32_t a2 = *reinterpret_cast<const uint32_t*>(
+            &sP[(row_t + 8) * B_TOPK + k_base + col_t + 0]);
+        uint32_t a3 = *reinterpret_cast<const uint32_t*>(
+            &sP[(row_t + 8) * B_TOPK + k_base + col_t + 2]);
+
+        #pragma unroll
+        for (int n_sub = 0; n_sub < 16; ++n_sub) {
+          const int n_local = warp_n_base + n_sub * 8 + row_t;
+          // Strided B load: 4 bf16 from 4 K-rows at fixed N column. Pack into
+          // 2 .b32 directly via raw bit views to avoid type-pun aliasing.
+          const uint16_t* sKb_u16 = reinterpret_cast<const uint16_t*>(sKb);
+          uint16_t v0 = sKb_u16[(k_base + col_t + 0) * STRIDE_QK_BF16 + n_local];
+          uint16_t v1 = sKb_u16[(k_base + col_t + 1) * STRIDE_QK_BF16 + n_local];
+          uint16_t v2 = sKb_u16[(k_base + col_t + 2) * STRIDE_QK_BF16 + n_local];
+          uint16_t v3 = sKb_u16[(k_base + col_t + 3) * STRIDE_QK_BF16 + n_local];
+          uint32_t b0 = (uint32_t)v0 | ((uint32_t)v1 << 16);
+          uint32_t b1 = (uint32_t)v2 | ((uint32_t)v3 << 16);
+          mma_m16n8k16_bf16_f32(rO[n_sub][0], rO[n_sub][1], rO[n_sub][2], rO[n_sub][3],
+                                a0, a1, a2, a3, b0, b1);
         }
-        rO[r][0] = acc0; rO[r][1] = acc1; rO[r][2] = acc2; rO[r][3] = acc3;
       }
     }
     __syncthreads();
   }
 
   // ---- Epilogue ----
-  if (num_splits == 1) {
-    bf16* out_t = final_out + t * NUM_HEADS * D_V;
-    const int col_base_warp = warp_id * DV_PER_WARP + lane * 4;
-    #pragma unroll
-    for (int r = 0; r < B_H; ++r) {
-      float inv = (rowsum_s[r] == 0.f) ? 0.f : 1.f / rowsum_s[r];
-      bf162 lo = __floats2bfloat162_rn(rO[r][0] * inv, rO[r][1] * inv);
-      bf162 hi = __floats2bfloat162_rn(rO[r][2] * inv, rO[r][3] * inv);
-      *reinterpret_cast<bf162*>(&out_t[r * D_V + col_base_warp])     = lo;
-      *reinterpret_cast<bf162*>(&out_t[r * D_V + col_base_warp + 2]) = hi;
-    }
-    if (warp_id == 0 && lane < B_H) {
-      float s = rowsum_s[lane];
-      float m = rowmax_s[lane];
-      float v = (m == -INFINITY || s == 0.f) ? -INFINITY : (log2f(s) + m);
-      final_lse[t * NUM_HEADS + lane] = v;
-    }
-  } else {
-    // Write *normalized* o_accum (rO / rowsum) and lse_accum = log2(rowsum) + rowmax.
-    // Combine kernel weights each split by 2^{lse_s - global_max}, sums normalized O, divides.
-    float* o_t = o_accum + ((int64_t)split * num_tokens + t) * NUM_HEADS * D_V;
-    float* l_t = lse_accum + ((int64_t)split * num_tokens + t) * NUM_HEADS;
-    const int col_base_warp = warp_id * DV_PER_WARP + lane * 4;
-    #pragma unroll
-    for (int r = 0; r < B_H; ++r) {
-      const float rs = rowsum_s[r];
-      const float inv = (rs == 0.f) ? 0.f : (1.f / rs);
-      o_t[r * D_V + col_base_warp    ] = rO[r][0] * inv;
-      o_t[r * D_V + col_base_warp + 1] = rO[r][1] * inv;
-      o_t[r * D_V + col_base_warp + 2] = rO[r][2] * inv;
-      o_t[r * D_V + col_base_warp + 3] = rO[r][3] * inv;
-    }
-    if (warp_id == 0 && lane < B_H) {
-      float s = rowsum_s[lane];
-      float m = rowmax_s[lane];
-      l_t[lane] = (m == -INFINITY || s == 0.f) ? -INFINITY : (log2f(s) + m);
+  // rO is now in mma's D layout: rO[n_sub][0..1] cover (row=row_t, col=col_d, col_d+1)
+  // and rO[n_sub][2..3] cover (row=row_t+8, col_d, col_d+1) within an N-sub-tile;
+  // each warp owns DV_PER_WARP=128 cols across 16 N-sub-tiles.
+  {
+    const int row_t  = lane / 4;
+    const int dcol_t = (lane % 4) * 2;
+    const int warp_n_base = warp_id * DV_PER_WARP;
+    const float rs0 = rowsum_s[row_t];
+    const float rs1 = rowsum_s[row_t + 8];
+    const float inv0 = (rs0 == 0.f) ? 0.f : (1.f / rs0);
+    const float inv1 = (rs1 == 0.f) ? 0.f : (1.f / rs1);
+
+    if (num_splits == 1) {
+      bf16* out_t = final_out + t * NUM_HEADS * D_V;
+      #pragma unroll
+      for (int n_sub = 0; n_sub < 16; ++n_sub) {
+        const int col_global = warp_n_base + n_sub * 8 + dcol_t;
+        bf162 lo = __floats2bfloat162_rn(rO[n_sub][0] * inv0, rO[n_sub][1] * inv0);
+        bf162 hi = __floats2bfloat162_rn(rO[n_sub][2] * inv1, rO[n_sub][3] * inv1);
+        *reinterpret_cast<bf162*>(&out_t[ row_t      * D_V + col_global]) = lo;
+        *reinterpret_cast<bf162*>(&out_t[(row_t + 8) * D_V + col_global]) = hi;
+      }
+      if (final_lse != nullptr && warp_id == 0 && lane < B_H) {
+        float s = rowsum_s[lane];
+        float m = rowmax_s[lane];
+        float v = (m == -INFINITY || s == 0.f) ? -INFINITY : (log2f(s) + m);
+        final_lse[t * NUM_HEADS + lane] = v;
+      }
+    } else {
+      // Write *normalized* o_accum (rO / rowsum) and lse_accum = log2(rowsum) + rowmax.
+      // Combine kernel weights each split by 2^{lse_s - global_max}, sums normalized O, divides.
+      float* o_t = o_accum + ((int64_t)split * num_tokens + t) * NUM_HEADS * D_V;
+      float* l_t = lse_accum + ((int64_t)split * num_tokens + t) * NUM_HEADS;
+      #pragma unroll
+      for (int n_sub = 0; n_sub < 16; ++n_sub) {
+        const int col_global = warp_n_base + n_sub * 8 + dcol_t;
+        o_t[ row_t      * D_V + col_global + 0] = rO[n_sub][0] * inv0;
+        o_t[ row_t      * D_V + col_global + 1] = rO[n_sub][1] * inv0;
+        o_t[(row_t + 8) * D_V + col_global + 0] = rO[n_sub][2] * inv1;
+        o_t[(row_t + 8) * D_V + col_global + 1] = rO[n_sub][3] * inv1;
+      }
+      if (warp_id == 0 && lane < B_H) {
+        float s = rowsum_s[lane];
+        float m = rowmax_s[lane];
+        l_t[lane] = (m == -INFINITY || s == 0.f) ? -INFINITY : (log2f(s) + m);
+      }
     }
   }
 }
 
 // ---------------- combine kernel ----------------
-// Merges per-split (o_accum, lse_accum) into final (output, lse) via log-sum-exp reduction.
-//
-// Each CTA handles one (token, head) pair.  NUM_HEADS=16 tokens=Ntok → Ntok*16 blocks.
-//
-// For a single head:
-//   lse_final = log2(sum_s 2^{lse_accum[s] - max_lse})  +  max_lse
-//   out_final = sum_s o_accum[s] * 2^{lse_accum[s] - max_lse_noscale}   (where noscale = used row-max)
-//   actually: o_accum[s] is already un-normalized (raw softmaxed * V, not divided by rowsum).
-//   rowsum_for_split_s = exp2(lse_accum[s] - (log2(rowsum_s) + max_s))
-//   Hmm — simpler to think in full terms:
-//     lse_accum[s] = log2(sum_j exp2(logit - max))+ max  → equivalent to log2(unnormalized_denom) + max
-//       where unnormalized_denom = sum exp(logit * ln2) = sum exp2(logit - max) * 2^max ≈ sum*2^max
-//
-//   We have per-split:
-//     rowsum_s[split]  = sum_j exp2(logit_scaled_j - local_max_s)
-//     rowmax_s[split]  = local_max_s
-//     o_accum[split]   = sum_j exp2(logit_j - local_max_s) * V[j]    (unnormalized by rowsum)
-//
-//   And we saved lse_s = log2(rowsum_s) + local_max_s.
-//
-//   Combine across splits:
-//     global_max = max_s(local_max_s)
-//     w_s = 2^{local_max_s - global_max}
-//     global_sum = sum_s (rowsum_s * w_s)  =  sum_s 2^{lse_s - global_max}
-//     o_final_unnorm = sum_s (o_accum[s] * w_s)
-//     o_final = o_final_unnorm / global_sum
-//     lse_final = log2(global_sum) + global_max
-//
-// Since lse_s = log2(rowsum_s) + local_max_s = log2(rowsum_s * 2^local_max_s),
-// 2^{lse_s - global_max} = rowsum_s * 2^{local_max_s - global_max} = rowsum_s * w_s.
-//
-// And o_accum[s] is unnormalized (before dividing by rowsum_s), so
-// (o_accum[s] * w_s) has the same weighting as rowsum_s * w_s.  Good.
+// Merges per-split (o_accum, lse_accum) into final (output, lse) via log-sum-exp.
+// One CTA per (token, head); 128 threads × 4 cols of D_V. Templated on
+// NUM_SPLITS (∈ {2,4,8,16,32}) so all NUM_SPLITS o_accum loads are issued back-
+// to-back with no carried dependency, and softmax/accumulate fully unroll.
 
-__global__ void dsa_mla_combine_kernel(
+template <int NUM_SPLITS>
+__launch_bounds__(D_V / 4, 4) __global__ void dsa_mla_combine_kernel(
     const float* __restrict__ o_accum,    // [S, T, H, D_V]
     const float* __restrict__ lse_accum,  // [S, T, H]
-    bf16*       __restrict__ output,       // [T, H, D_V]
-    float*      __restrict__ lse,          // [T, H]
-    int32_t num_splits,
-    int32_t num_tokens)
-{
+    bf16*        __restrict__ output,     // [T, H, D_V]
+    float*       __restrict__ lse,        // [T, H] or nullptr
+    int32_t num_tokens) {
+  static_assert(NUM_SPLITS >= 2 && NUM_SPLITS <= NUM_KV_BLOCKS);
   const int th = blockIdx.x;
   const int t = th / NUM_HEADS;
   const int h = th % NUM_HEADS;
   if (t >= num_tokens) return;
-
   const int tid = threadIdx.x;
-  constexpr int CTA = 128;  // 1 CTA of 128 threads, each handles D_V/128 = 4 cols.
-
-  // Step 1: global_max over splits.
-  float gmax = -INFINITY;
-  for (int s = 0; s < num_splits; ++s) {
-    float lv = lse_accum[(int64_t)s * num_tokens * NUM_HEADS + t * NUM_HEADS + h];
-    gmax = fmaxf(gmax, lv);
-  }
-
-  // Step 2: per-split w_s = 2^{lse_s - gmax}, global_sum.
-  float gsum = 0.f;
-  for (int s = 0; s < num_splits; ++s) {
-    float lv = lse_accum[(int64_t)s * num_tokens * NUM_HEADS + t * NUM_HEADS + h];
-    if (lv != -INFINITY) {
-      gsum += exp2f(lv - gmax);
-    }
-  }
-
-  // Step 3: per col_group, accumulate o.
-  // Each thread handles D_V/CTA = 4 consecutive cols.
   const int col_base = tid * 4;
-  float4 acc = {0.f, 0.f, 0.f, 0.f};
-  for (int s = 0; s < num_splits; ++s) {
-    float lv = lse_accum[(int64_t)s * num_tokens * NUM_HEADS + t * NUM_HEADS + h];
-    if (lv == -INFINITY) continue;
-    // w = 2^{lv - gmax}  — but lv = log2(rowsum_s) + local_max_s, so
-    // w = rowsum_s * 2^{local_max_s - gmax}.  o_accum has the *unnormalized* running sum
-    // sum_j exp2(logit - local_max_s) * V = (rowsum_s-weighted).
-    // Net: o_final unnormalized contribution = o_accum * 2^{local_max_s - gmax}.
-    // We only stored lv = log2(rowsum_s) + local_max_s, not local_max_s alone.  But we can
-    // recover exp2(local_max_s - gmax) = exp2(lv - gmax) / rowsum_s.  Hmm, we don't have rowsum.
-    //
-    // Alternative: don't store the raw unnormalized o_accum.  Store normalized o_accum/rowsum
-    // instead.  Then o_final = sum_s (o_accum_norm * 2^{lv - gmax}) / sum_s 2^{lv - gmax}.
-    //
-    // That's much simpler if the split kernel NORMALIZES o_accum before writing.
-    // So I'll change the split kernel to write o_accum = rO / rowsum_s.
-    const float w = exp2f(lv - gmax);
-    const float* o_t = o_accum + ((int64_t)s * num_tokens + t) * NUM_HEADS * D_V + h * D_V;
-    float4 a = *reinterpret_cast<const float4*>(&o_t[col_base]);
-    acc.x += a.x * w;
-    acc.y += a.y * w;
-    acc.z += a.z * w;
-    acc.w += a.w * w;
+
+  __shared__ float s_lse[NUM_SPLITS];
+  if (tid < NUM_SPLITS) {
+    s_lse[tid] = lse_accum[(int64_t)tid * num_tokens * NUM_HEADS + t * NUM_HEADS + h];
   }
-  const float inv_gsum = (gsum == 0.f) ? 0.f : (1.f / gsum);
-  acc.x *= inv_gsum;
-  acc.y *= inv_gsum;
-  acc.z *= inv_gsum;
-  acc.w *= inv_gsum;
+
+  float o_local[NUM_SPLITS][4];
+#pragma unroll
+  for (int s = 0; s < NUM_SPLITS; ++s) {
+    const float* o_p =
+        o_accum + ((int64_t)s * num_tokens + t) * NUM_HEADS * D_V + h * D_V + col_base;
+    float4 a = *reinterpret_cast<const float4*>(o_p);
+    o_local[s][0] = a.x;
+    o_local[s][1] = a.y;
+    o_local[s][2] = a.z;
+    o_local[s][3] = a.w;
+  }
+
+  __syncthreads();
+
+  float local_lse[NUM_SPLITS];
+#pragma unroll
+  for (int s = 0; s < NUM_SPLITS; ++s) local_lse[s] = s_lse[s];
+
+  float gmax = -INFINITY;
+#pragma unroll
+  for (int s = 0; s < NUM_SPLITS; ++s) gmax = fmaxf(gmax, local_lse[s]);
+
+  float gsum = 0.f;
+  float scales[NUM_SPLITS];
+#pragma unroll
+  for (int s = 0; s < NUM_SPLITS; ++s) {
+    float w = (local_lse[s] == -INFINITY) ? 0.f : exp2f(local_lse[s] - gmax);
+    scales[s] = w;
+    gsum += w;
+  }
+  const float inv_gsum = (gsum == 0.f) ? 0.f : __frcp_rn(gsum);
+
+  float4 acc = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+  for (int s = 0; s < NUM_SPLITS; ++s) {
+    const float w = scales[s] * inv_gsum;
+    acc.x += w * o_local[s][0];
+    acc.y += w * o_local[s][1];
+    acc.z += w * o_local[s][2];
+    acc.w += w * o_local[s][3];
+  }
 
   bf16* out_p = output + t * NUM_HEADS * D_V + h * D_V + col_base;
   bf162 lo = __floats2bfloat162_rn(acc.x, acc.y);
   bf162 hi = __floats2bfloat162_rn(acc.z, acc.w);
-  *reinterpret_cast<bf162*>(out_p    ) = lo;
+  *reinterpret_cast<bf162*>(out_p) = lo;
   *reinterpret_cast<bf162*>(out_p + 2) = hi;
-
-  if (tid == 0) {
+  if (lse != nullptr && tid == 0) {
     float v = (gmax == -INFINITY || gsum == 0.f) ? -INFINITY : (log2f(gsum) + gmax);
     lse[t * NUM_HEADS + h] = v;
   }
 }
 
 // Choose num_splits — prefer divisors of NUM_KV_BLOCKS for balanced work.
+//
+// We aim for `T * num_splits` to be ≤ 2 * num_sms so each SM holds at most 2 CTAs
+// (the kernel is launch_bounded(2)). At the upper end the overlap of two CTAs on
+// one SM hides cp.async / smem latency better than one large CTA per SM.
+//
+// At low T we cap num_splits at NUM_KV_BLOCKS so each CTA owns ≥1 block.
 __host__ inline int choose_num_splits(int num_tokens, int num_sms) {
-  int want = (num_sms + num_tokens - 1) / num_tokens;
+  // Target 2 CTAs/SM utilization; pick the largest divisor that doesn't blow past it.
+  int want = (2 * num_sms + num_tokens - 1) / num_tokens;
   int candidates[] = {32, 16, 8, 4, 2, 1};
   for (int c : candidates) {
     if (c <= want) return c;
@@ -478,7 +528,11 @@ void dsa_mla_decode(
   TensorMatcher({Npage, (int64_t)PAGE_SIZE, (int64_t)D_KPE}).with_dtype<bf16_t>().with_device<kDLCUDA>(dev_).verify(kpe_cache);
   TensorMatcher({Ntok, (int64_t)TOPK}).with_dtype<int32_t>().with_device<kDLCUDA>(dev_).verify(sparse_indices);
   TensorMatcher({Ntok, (int64_t)NUM_HEADS, (int64_t)D_V}).with_dtype<bf16_t>().with_device<kDLCUDA>(dev_).verify(output);
-  TensorMatcher({Ntok, (int64_t)NUM_HEADS}).with_dtype<float>().with_device<kDLCUDA>(dev_).verify(lse);
+  // lse is optional: a 1-D zero-numel tensor signals "skip writing lse".
+  const bool want_lse = (lse.numel() > 0);
+  if (want_lse) {
+    TensorMatcher({Ntok, (int64_t)NUM_HEADS}).with_dtype<float>().with_device<kDLCUDA>(dev_).verify(lse);
+  }
   // workspace is bytes (uint8) 1D, validated loosely.
   RuntimeCheck(workspace.device().device_type == kDLCUDA, "workspace must be CUDA");
 
@@ -507,6 +561,9 @@ void dsa_mla_decode(
 
   const float sm_scale_log2 = static_cast<float>(sm_scale) * 1.4426950408889634f;
 
+  bf16* out_ptr = static_cast<bf16*>(output.data_ptr());
+  float* lse_ptr = want_lse ? static_cast<float*>(lse.data_ptr()) : nullptr;
+
   if (num_splits == 1) {
     dim3 grid(num_tokens);
     dim3 block(NUM_THREADS);
@@ -517,8 +574,7 @@ void dsa_mla_decode(
         static_cast<const bf16*>(kpe_cache.data_ptr()),
         static_cast<const int32_t*>(sparse_indices.data_ptr()),
         nullptr, nullptr,
-        static_cast<bf16*>(output.data_ptr()),
-        static_cast<float*>(lse.data_ptr()),
+        out_ptr, lse_ptr,
         num_tokens, num_kv_tokens, 1, sm_scale_log2);
   } else {
     // Carve workspace: [o_accum float[S,T,16,512]][lse_accum float[S,T,16]] with alignment.
@@ -546,10 +602,18 @@ void dsa_mla_decode(
 
     dim3 cgrid(num_tokens * NUM_HEADS);
     dim3 cblk(D_V / 4);   // 128 threads × 4 cols
-    dsa_mla_combine_kernel<<<cgrid, cblk, 0, stream>>>(
-        o_accum, lse_accum,
-        static_cast<bf16*>(output.data_ptr()),
-        static_cast<float*>(lse.data_ptr()),
-        num_splits, num_tokens);
+#define LAUNCH_COMBINE(NS)                                                                \
+  dsa_mla_combine_kernel<NS><<<cgrid, cblk, 0, stream>>>(                                 \
+      o_accum, lse_accum, out_ptr, lse_ptr, num_tokens);
+    switch (num_splits) {
+      case 2:  LAUNCH_COMBINE(2);  break;
+      case 4:  LAUNCH_COMBINE(4);  break;
+      case 8:  LAUNCH_COMBINE(8);  break;
+      case 16: LAUNCH_COMBINE(16); break;
+      case 32: LAUNCH_COMBINE(32); break;
+      default:
+        RuntimeCheck(false, "dsa_mla: unsupported num_splits ", num_splits);
+    }
+#undef LAUNCH_COMBINE
   }
 }

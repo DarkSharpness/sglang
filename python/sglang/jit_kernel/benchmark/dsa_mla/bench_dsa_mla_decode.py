@@ -1,14 +1,20 @@
-"""Benchmark sparse MLA decode — compares jit kernel vs flashinfer/FA4 baselines.
+"""Benchmark sparse MLA decode — compares jit kernel vs the official flashinfer
+wrapper at baselines/dsa_sparse_attention/main.py.
 
-Spec: dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64
+Both runners use the SAME public signature
+    run(q_nope, q_pe, ckv_cache, kpe_cache, sparse_indices, sm_scale) -> (output,)
+and ALL preprocessing (seq_lens derivation, layout transforms, workspace alloc)
+runs INSIDE that call. The timing window is therefore an honest "what does
+deployment cost" comparison.
 """
 
 from __future__ import annotations
 
 import argparse
 import math
-import time
-from typing import Callable, Dict
+import os
+import sys
+from typing import Callable
 
 import torch
 
@@ -19,8 +25,19 @@ from sglang.jit_kernel.dsa_mla import (
     PAGE_SIZE,
     TOPK,
     dsa_mla_decode,
-    ref_dsa_mla_decode,
 )
+
+
+_OFFICIAL_PATH = "/data/dark/Ave-Mujica/.vscode/baselines/dsa_sparse_attention"
+
+
+def _load_official_run() -> Callable:
+    if _OFFICIAL_PATH not in sys.path:
+        sys.path.insert(0, _OFFICIAL_PATH)
+    import importlib
+
+    main_mod = importlib.import_module("main")
+    return main_mod.run
 
 
 def make_inputs(num_tokens: int, seqlen: int, seed: int = 0, device: str = "cuda"):
@@ -32,7 +49,6 @@ def make_inputs(num_tokens: int, seqlen: int, seed: int = 0, device: str = "cuda
     ckv = torch.randn((num_pages, PAGE_SIZE, HEAD_DIM_CKV), dtype=torch.bfloat16, device=device)
     kpe = torch.randn((num_pages, PAGE_SIZE, HEAD_DIM_KPE), dtype=torch.bfloat16, device=device)
     indices = torch.empty((num_tokens, TOPK), dtype=torch.int32, device=device)
-    total = num_pages * PAGE_SIZE
     for t in range(num_tokens):
         k = min(TOPK, seqlen)
         perm = torch.randperm(seqlen, generator=g)[:k].to(torch.int32).to(device)
@@ -45,7 +61,7 @@ def make_inputs(num_tokens: int, seqlen: int, seed: int = 0, device: str = "cuda
     return q_nope, q_pe, ckv, kpe, indices, sm_scale
 
 
-def bench(fn: Callable, args, warmup: int = 10, rep: int = 100) -> float:
+def bench(fn: Callable, args, warmup: int = 20, rep: int = 200) -> float:
     """Return median latency in microseconds."""
     for _ in range(warmup):
         fn(*args)
@@ -63,90 +79,74 @@ def bench(fn: Callable, args, warmup: int = 10, rep: int = 100) -> float:
     return times[len(times) // 2] * 1000.0  # µs
 
 
-# --- Candidate runners ---
-
-def run_ours(q_nope, q_pe, ckv, kpe, idx, scale):
-    out, lse = dsa_mla_decode(q_nope, q_pe, ckv, kpe, idx, scale)
-    return out, lse
+def run_ours(q_nope, q_pe, ckv_cache, kpe_cache, sparse_indices, sm_scale):
+    return dsa_mla_decode(q_nope, q_pe, ckv_cache, kpe_cache, sparse_indices, sm_scale)
 
 
-def run_flashinfer_trtllm(q_nope, q_pe, ckv, kpe, idx, scale):
-    """Uses flashinfer's trtllm_batch_decode_with_kv_cache_mla.
+# ---- flash_mla baseline ----
+# FlashMLA's SM100 sparse decode requires h_q to be a multiple of 128. For h=16
+# we pad q to 128 heads (the other 112 are dummy), let the kernel run on h=128,
+# then slice the first 16 heads back. This is the canonical way to call
+# flash_mla_sparse_fwd from a model with smaller h_q (see
+# sglang/srt/layers/attention/nsa_backend.py:_forward_flashmla_sparse).
+_FLASH_MLA_PAD = 128  # Blackwell minimum
 
-    Needs block_tables + seq_lens form.  This is the API name the bench targets.
-    """
-    from flashinfer.decode import trtllm_batch_decode_with_kv_cache_mla  # type: ignore
 
-    # Construct merged kv_cache of shape [num_pages, 1, page_size, D_CKV + D_KPE]
-    # (3-D is also accepted; use 4-D for newer flashinfer.)
-    num_pages, page_size, _ = ckv.shape
-    kv_cat = torch.cat([ckv, kpe], dim=-1)  # [P, 64, 576]
-    kv_cache = kv_cat.unsqueeze(1)  # [P, 1, 64, 576]
-
-    # Build query in the expected layout: [B*S, H, d_qk] concatenated nope||pe.
-    q_cat = torch.cat([q_nope, q_pe], dim=-1)  # [T, 16, 576]
-    query = q_cat.unsqueeze(1)  # [T, 1, 16, 576] (q_len_per_request=1)
-
-    num_tokens = q_nope.size(0)
-    # block_tables for sparse MLA: shape [batch, q_len_per_req=1, topk].
-    block_tables = idx.unsqueeze(1)  # [T, 1, 2048]
-
-    seq_lens = torch.full((num_tokens,), TOPK, dtype=torch.int32, device=q_nope.device)
-    workspace = torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device=q_nope.device)
-
-    out = trtllm_batch_decode_with_kv_cache_mla(
-        query=query,
-        kv_cache=kv_cache,
-        workspace_buffer=workspace,
-        qk_nope_head_dim=HEAD_DIM_CKV,  # note: misnamed; pass kv_lora_rank here
-        kv_lora_rank=HEAD_DIM_CKV,
-        qk_rope_head_dim=HEAD_DIM_KPE,
-        block_tables=block_tables,
-        seq_lens=seq_lens,
-        max_seq_len=TOPK,
-        sparse_mla_top_k=TOPK,
-        bmm1_scale=float(scale),
-        bmm2_scale=1.0,
+def run_flash_mla(q_nope, q_pe, ckv_cache, kpe_cache, sparse_indices, sm_scale):
+    from sgl_kernel.flash_mla import flash_mla_sparse_fwd
+    T, H, _ = q_nope.shape
+    num_pages, page_size, _ = ckv_cache.shape
+    D_QK = HEAD_DIM_CKV + HEAD_DIM_KPE
+    # Pad q to [T, 128, D_QK].
+    q_padded = q_nope.new_zeros((T, _FLASH_MLA_PAD, D_QK))
+    q_padded[:, :H, :HEAD_DIM_CKV] = q_nope
+    q_padded[:, :H, HEAD_DIM_CKV:] = q_pe
+    # Concatenate kv into [num_pages*page_size, 1, D_QK] (h_kv=1).
+    kv = torch.cat([ckv_cache, kpe_cache], dim=-1).reshape(
+        num_pages * page_size, 1, D_QK
     )
-    return out
+    # indices: [s_q, h_kv=1, topk]
+    idx = sparse_indices.unsqueeze(1)
+    out, _, _ = flash_mla_sparse_fwd(q_padded, kv, idx, float(sm_scale))
+    return (out[:, :H, :],)  # slice back to h=16
 
 
-def run_flash_attention_v4(q_nope, q_pe, ckv, kpe, idx, scale):
-    """Uses FA4 cute-dsl decode path.  Best-effort; may require padding q heads."""
-    # Padding h=16 → h=128 by replication is the FA4 DSA assumption (MQA 128).
-    # For a quick benchmark, use flash_attn_varlen_func with top-k indices ... skipped.
-    raise NotImplementedError
-
-
-BENCHES: Dict[str, Callable] = {
+RUNNERS = {
     "ours": run_ours,
-    "flashinfer_trtllm": run_flashinfer_trtllm,
+    "flash_mla": run_flash_mla,
 }
 
 
-def format_bw(seqlen: int, num_tokens: int, us: float) -> str:
-    # Approx bytes moved per token: topk * (ckv*2 + kpe*2) + q/output
+def format_bw(num_tokens: int, us: float) -> str:
     per_tok_k_bytes = TOPK * (HEAD_DIM_CKV * 2 + HEAD_DIM_KPE * 2)
     total_bytes = num_tokens * per_tok_k_bytes
-    gb_per_s = total_bytes / (us * 1e-6) / 1e9
-    return f"{gb_per_s:.1f} GB/s"
+    return f"{total_bytes / (us * 1e-6) / 1e9:.1f} GB/s"
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--num-tokens", nargs="+", type=int, default=[1, 2, 4, 8])
-    ap.add_argument("--seqlen", nargs="+", type=int, default=[4096, 8192, 16384])
+    ap.add_argument("--seqlen", nargs="+", type=int, default=[8192])
     ap.add_argument("--runners", nargs="+", default=None)
-    ap.add_argument("--warmup", type=int, default=10)
-    ap.add_argument("--rep", type=int, default=50)
+    ap.add_argument("--warmup", type=int, default=20)
+    ap.add_argument("--rep", type=int, default=200)
+    ap.add_argument("--no-official", action="store_true",
+                    help="skip the official flashinfer wrapper baseline")
     args = ap.parse_args()
 
-    runners = args.runners or list(BENCHES.keys())
+    runners = dict(RUNNERS)
+    if not args.no_official:
+        try:
+            runners["official_flashinfer"] = _load_official_run()
+        except Exception as e:
+            print(f"[warn] could not load official baseline: {e}", file=sys.stderr)
+
+    if args.runners:
+        runners = {k: runners[k] for k in args.runners if k in runners}
 
     # Trigger JIT compile once.
     if "ours" in runners:
-        inp = make_inputs(1, 1024)
-        run_ours(*inp)
+        run_ours(*make_inputs(1, 1024))
     torch.cuda.synchronize()
 
     header = f"{'tokens':>6} {'seqlen':>7} {'runner':>22} {'µs':>10} {'bw':>14}"
@@ -155,12 +155,11 @@ def main():
 
     for T in args.num_tokens:
         for S in args.seqlen:
-            inp = make_inputs(T, S)
-            for name in runners:
+            inputs = make_inputs(T, S)
+            for name, fn in runners.items():
                 try:
-                    us = bench(BENCHES[name], inp, warmup=args.warmup, rep=args.rep)
-                    bw = format_bw(S, T, us)
-                    print(f"{T:>6} {S:>7} {name:>22} {us:>10.2f} {bw:>14}")
+                    us = bench(fn, inputs, warmup=args.warmup, rep=args.rep)
+                    print(f"{T:>6} {S:>7} {name:>22} {us:>10.2f} {format_bw(T, us):>14}")
                 except Exception as e:
                     print(f"{T:>6} {S:>7} {name:>22}  ERROR: {e}")
 

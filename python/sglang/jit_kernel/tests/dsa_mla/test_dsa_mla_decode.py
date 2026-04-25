@@ -13,7 +13,7 @@ from sglang.jit_kernel.dsa_mla import (
     NUM_QO_HEADS,
     PAGE_SIZE,
     TOPK,
-    dsa_mla_decode,
+    dsa_mla_decode_with_lse as dsa_mla_decode,
     ref_dsa_mla_decode,
 )
 
