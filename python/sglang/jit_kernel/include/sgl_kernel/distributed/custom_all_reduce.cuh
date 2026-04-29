@@ -82,7 +82,8 @@ struct CustomAllReduceBase : public tvm::ffi::Object {
       uint32_t max_num_cta_push,
       int64_t pull_buffer_size,
       int64_t push_buffer_size,
-      int64_t graph_buffer_count)
+      int64_t graph_buffer_count,
+      bool is_mnnvl = false)
       : m_pull_buffer_bytes(pull_buffer_size),
         m_push_buffer_bytes(push_buffer_size),
         m_graph_buffer_count(graph_buffer_count),
@@ -90,6 +91,7 @@ struct CustomAllReduceBase : public tvm::ffi::Object {
         m_num_gpu(num_gpu),
         m_max_num_cta_pull(max_num_cta_pull),
         m_max_num_cta_push(max_num_cta_push),
+        m_is_mnnvl(is_mnnvl),
         // default config for pull kernel, can be updated by `configure()`
         m_num_cta(max_num_cta_pull),
         m_cta_size(256) {
@@ -100,7 +102,62 @@ struct CustomAllReduceBase : public tvm::ffi::Object {
     const int64_t push_buffer_size_all = push_all_ranks_bytes();
     RuntimeCheck(pull_buffer_size <= kU32Max, "Pull buffer size is too large: ", pull_buffer_size);
     RuntimeCheck(push_buffer_size_all <= kU32Max, "Push buffer size is too large: ", push_buffer_size_all);
-    RuntimeDeviceCheck(cudaMalloc(&m_storage, storage_bytes()));
+    if (!m_is_mnnvl) {
+      // MNNVL mode allocates m_storage externally (via fabric/VMM) and sets it
+      // through `set_storage_mnnvl`; the local cudaMalloc path is skipped.
+      RuntimeDeviceCheck(cudaMalloc(&m_storage, storage_bytes()));
+    }
+  }
+
+  int64_t storage_size() const {
+    return storage_bytes();
+  }
+
+  // MNNVL: install externally-allocated symmetric storage (fabric VMM). Must be
+  // called before `post_init_mnnvl` and may only be used in MNNVL mode.
+  void set_storage_mnnvl(int64_t local_storage_ptr) {
+    RuntimeCheck(m_is_mnnvl, "set_storage_mnnvl is only valid in MNNVL mode");
+    RuntimeCheck(m_storage == nullptr, "Storage already set");
+    m_storage = reinterpret_cast<void*>(local_storage_ptr);
+  }
+
+  // MNNVL counterpart to `post_init`: peers' symmetric pointers are already in
+  // the local virtual address space (via cuMemMap), so we skip cudaIpcOpen.
+  void post_init_mnnvl(tvm::ffi::Array<int64_t> peer_storage_ptrs) {
+    using host::RuntimeCheck;
+    RuntimeCheck(m_is_mnnvl, "post_init_mnnvl is only valid in MNNVL mode");
+    RuntimeCheck(m_storage != nullptr, "Local storage not set; call set_storage_mnnvl first");
+    RuntimeCheck(peer_storage_ptrs.size() == m_num_gpu, "Invalid peer pointer array size: ", peer_storage_ptrs.size());
+
+    m_peer_storage.resize(m_num_gpu);
+    for (const auto i : irange(m_num_gpu)) {
+      const int64_t raw = peer_storage_ptrs[i];
+      RuntimeCheck(raw != 0, "Null peer pointer for rank ", i);
+      m_peer_storage[i] = reinterpret_cast<void*>(static_cast<uintptr_t>(raw));
+    }
+    RuntimeCheck(m_peer_storage[m_rank] == m_storage, "Local rank pointer mismatch");
+
+    // set signal buffer to zero
+    const auto pull_signal = get_pull_signal(m_storage);
+    RuntimeDeviceCheck(cudaMemset(pull_signal, 0, pull_signal_bytes()));
+
+    // update the pull controller and data pointer
+    RuntimeCheck(!m_pull_ctrl.has_value(), "Controller is already initialized");
+    m_pull_ctrl.emplace(m_peer_storage.data(), m_num_gpu);
+    AllReduceData data;
+    for (const auto i : irange(m_num_gpu)) {
+      data.input[i] = get_pull_buffer(m_peer_storage[i]);
+    }
+    const auto default_data_ptr = get_data_ptr();
+    RuntimeDeviceCheck(cudaMemcpy(default_data_ptr, &data, sizeof(AllReduceData), cudaMemcpyHostToDevice));
+
+    // update the push controller and data pointer
+    RuntimeCheck(!m_push_ctrl.has_value(), "Controller is already initialized");
+    const auto push_signal = get_push_signal(m_storage);
+    RuntimeDeviceCheck(cudaMemset(push_signal, 0, push_signal_bytes()));
+    m_push_ctrl.emplace(push_signal);
+    const auto push_buffer = get_push_buffer(m_storage);
+    RuntimeDeviceCheck(cudaMemset(push_buffer, 0, push_all_ranks_bytes()));
   }
 
   ExternHandle share_storage() {
@@ -214,6 +271,7 @@ struct CustomAllReduceBase : public tvm::ffi::Object {
   }
 
   void free_ipc_handles() {
+    // MNNVL mode does not open cudaIpc handles for graph inputs; nothing to do.
     for (const auto& pair : m_ipc_cache) {
       host::RuntimeDeviceCheck(cudaIpcCloseMemHandle(pair.second));
     }
@@ -221,7 +279,11 @@ struct CustomAllReduceBase : public tvm::ffi::Object {
   }
 
   void free_storage() {
-    host::RuntimeDeviceCheck(cudaFree(m_storage));
+    // In MNNVL mode the storage is owned by the Python-side fabric allocator;
+    // we just release our reference and let it tear down the VMM mappings.
+    if (!m_is_mnnvl && m_storage != nullptr) {
+      host::RuntimeDeviceCheck(cudaFree(m_storage));
+    }
     m_storage = nullptr;
   }
 
@@ -306,6 +368,7 @@ struct CustomAllReduceBase : public tvm::ffi::Object {
   const uint32_t m_num_gpu;
   const uint32_t m_max_num_cta_pull;
   const uint32_t m_max_num_cta_push;
+  const bool m_is_mnnvl;
   // these 2 config should only affect pull kernel
   uint32_t m_num_cta;
   uint32_t m_cta_size;

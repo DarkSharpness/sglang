@@ -33,12 +33,17 @@ class CustomAllReduceV2:
         device: torch.device,
         max_pull_size: Optional[int] = None,
         max_push_size: Optional[int] = None,
+        use_mnnvl: Optional[bool] = None,
     ) -> None:
         _init_config()
         self.disabled = True
         self.group = group
         self.rank = dist.get_rank(group=self.group)
         self.world_size = dist.get_world_size(group=self.group)
+        if use_mnnvl is None:
+            from sglang.srt.environ import envs
+
+            use_mnnvl = envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2_MNNVL.get()
         self.override_shot(None)
         if max_pull_size is None:
             max_pull_size = 16 * 1024 * 1024  # default to 16MB
@@ -47,6 +52,8 @@ class CustomAllReduceV2:
         max_push_size = min(max_push_size, max_pull_size)
         self.max_pull_size = max_pull_size
         self.max_push_size = max_push_size
+        self.use_mnnvl = use_mnnvl
+        self._mnnvl_mem = None
         self.override_algo: Optional[AllReduceAlgo] = None
         self.obj = get_custom_all_reduce_cls()(
             rank=self.rank,
@@ -54,10 +61,17 @@ class CustomAllReduceV2:
             pull_buffer_bytes=self.max_pull_size,
             push_buffer_bytes=self.max_push_size,
             graph_input_count=131072,
+            is_mnnvl=bool(use_mnnvl),
         )
-        self._post_init_obj()
+        if use_mnnvl:
+            self._post_init_obj_mnnvl(device)
+        else:
+            self._post_init_obj()
         self.disabled = False
-        log_info_on_rank0(logger, "Custom allreduce v2 initialized successfully")
+        log_info_on_rank0(
+            logger,
+            f"Custom allreduce v2 initialized successfully (mnnvl={use_mnnvl})",
+        )
 
     def override_shot(self, shot: int | None):
         if shot is None:
@@ -69,6 +83,14 @@ class CustomAllReduceV2:
 
     @contextmanager
     def capture(self):
+        # MNNVL mode cannot register torch-allocated tensor pointers as
+        # peer-accessible inputs (those tensors aren't in the fabric mapping),
+        # so we always go through the staging-buffer path. The kernel still
+        # captures into a CUDA graph correctly because the staging memcpys
+        # are launched on the captured stream.
+        if self.use_mnnvl:
+            yield
+            return
         try:
             self.obj.set_cuda_graph_capture(True)
             yield
@@ -104,8 +126,23 @@ class CustomAllReduceV2:
         return self._all_reduce(input)
 
     def close(self):
-        if not self.disabled and hasattr(self, "obj"):
+        # Idempotent -- `__del__` calls this again at GC time (often after the
+        # caller already invoked dist.destroy_process_group), so guard every
+        # external call so we don't re-enter cudaIpcClose, cuMemUnmap, or a
+        # collective on a torn-down group.
+        if self.disabled or not hasattr(self, "obj"):
+            return
+        self.disabled = True
+        try:
             self.obj.free(self.group)
+        except Exception as e:
+            logger.debug("CustomAllReduceV2.obj.free failed during close: %s", e)
+        if self._mnnvl_mem is not None:
+            try:
+                self._mnnvl_mem.close()
+            except Exception as e:
+                logger.debug("MNNVL fabric teardown failed during close: %s", e)
+            self._mnnvl_mem = None
 
     def _all_reduce(self, input: torch.Tensor) -> torch.Tensor:
         """Perform the actual all-reduce via JIT kernel."""
@@ -129,6 +166,24 @@ class CustomAllReduceV2:
         assert all(len(r) == 1 for r in result)
         result = [h[0] for h in result]
         self.obj.post_init(result)
+
+    def _post_init_obj_mnnvl(self, device: torch.device):
+        """Allocate the storage region as MNNVL fabric memory and install it.
+
+        The C++ object was constructed with ``is_mnnvl=True`` so it skipped its
+        local cudaMalloc and is waiting for an external pointer. We size the
+        fabric region to ``storage_size()`` (queried from C++) so the layout
+        matches what the kernels expect, then hand both the local pointer and
+        the per-rank peer pointers down to the C++ side.
+        """
+        from sglang.srt.distributed.device_communicators.mnnvl_memory import (
+            MnnvlSymmMemory,
+        )
+
+        storage_size = int(self.obj.storage_size())
+        self._mnnvl_mem = MnnvlSymmMemory(self.group, device, storage_size)
+        self.obj.set_storage_mnnvl(int(self._mnnvl_mem.local_ptr))
+        self.obj.post_init_mnnvl([int(p) for p in self._mnnvl_mem.peer_ptrs])
 
     def _share_list(self, input: List[T]) -> List[List[T]]:
         input_tensor = torch.tensor(input, dtype=torch.int64, device="cpu")
@@ -167,6 +222,18 @@ def _init_config():
             8: ModeConfig(160 * KB, 160 * KB),
         }
     # TODO: tune on more GPUs, e.g A100
+
+    # MNNVL fabric overlay -- only the common TP=4/TP=8 configs are tuned;
+    # other world sizes inherit the underlying B200/H200 values above.
+    # Tuned on GB300 NVL72 (sm_103) with `SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2_MNNVL=1`,
+    # bf16, CUDA-graph captured replay; see bench data in PR description.
+    # 1-shot pull is never optimal on this fabric, so push and pull thresholds
+    # match (the determine_algo logic skips the 1-shot-pull regime when equal).
+    from sglang.srt.environ import envs
+
+    if envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2_MNNVL.get():
+        THRESHOLD_2_SHOT_MAP[4] = ModeConfig(3 * MB, 3 * MB)  # TP=4 intra-node
+        THRESHOLD_2_SHOT_MAP[8] = ModeConfig(1 * MB, 1 * MB)  # TP=8 cross-node
 
 
 THRESHOLD_2_SHOT_MAP: Dict[int, ModeConfig] = {}

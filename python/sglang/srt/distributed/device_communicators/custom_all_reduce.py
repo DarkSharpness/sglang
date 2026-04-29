@@ -433,6 +433,14 @@ def dispatch_custom_allreduce():
     On AMD with 1-stage AR enabled, use sglang's CustomAllreduce (has deterministic_all_reduce method).
     Otherwise use AiterCustomAllreduce if available.
     """
+    # Flashinfer MNNVL takes precedence over our v2: same fabric requirement
+    # but uses NVSwitch multicast (scales beyond TP=8) when available.
+    if _is_cuda and envs.SGLANG_OPT_USE_FLASHINFER_MNNVL_AR.get():
+        from .flashinfer_mnnvl_allreduce import FlashInferMnnvlAllReduce
+
+        logger.debug("[AR] Using FlashInferMnnvlAllReduce")
+        return FlashInferMnnvlAllReduce
+
     if _is_cuda and envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2.get():
         from .custom_all_reduce_v2 import CustomAllReduceV2
 

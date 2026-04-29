@@ -48,6 +48,7 @@ if TYPE_CHECKING:
             *,
             max_pull_blocks: Optional[int] = None,
             max_push_blocks: Optional[int] = None,
+            is_mnnvl: bool = False,
         ) -> None:
             """
             Create a CustomAllReduceObj instance.
@@ -61,6 +62,9 @@ if TYPE_CHECKING:
                                     If None, it will be determined by the implementation.
             :param max_push_blocks: The maximum number of thread blocks to launch for push-based all-reduce.
                                     If None, it will be determined by the implementation.
+            :param is_mnnvl: If True, skip the local cudaMalloc for the storage region. The caller must
+                             externally allocate symmetric fabric memory and install it via
+                             ``set_storage_mnnvl`` / ``post_init_mnnvl`` before any all-reduce call.
             """
 
         @property
@@ -74,6 +78,9 @@ if TYPE_CHECKING:
         def all_reduce(
             self, input: torch.Tensor, algo: AllReduceAlgo
         ) -> tvm_ffi.Tensor: ...
+        def storage_size(self) -> int: ...
+        def set_storage_mnnvl(self, local_ptr: int) -> None: ...
+        def post_init_mnnvl(self, peer_ptrs: List[int]) -> None: ...
         def config_pull(
             self, num_blocks: int = -1, num_threads: int = -1
         ) -> ConfigResult:
@@ -143,6 +150,7 @@ def get_custom_all_reduce_cls() -> type[CustomAllReduceObj]:
             *,
             max_pull_blocks: Optional[int] = None,
             max_push_blocks: Optional[int] = None,
+            is_mnnvl: bool = False,
         ) -> None:
             max_pull_blocks = NUM_CTA if max_pull_blocks is None else max_pull_blocks
             max_push_blocks = NUM_CTA if max_push_blocks is None else max_push_blocks
@@ -154,8 +162,10 @@ def get_custom_all_reduce_cls() -> type[CustomAllReduceObj]:
                 pull_buffer_bytes,
                 push_buffer_bytes,
                 graph_input_count,
+                is_mnnvl,
             )
             self._world_size = world_size
+            self._is_mnnvl = is_mnnvl
             self._pull_config = ConfigResult(min(NUM_CTA, max_pull_blocks), MAX_THREADS)
             if max_pull_blocks > 0:  # special case: cannot configure 0 blocks
                 self.configure_pull(*self._pull_config)  # type: ignore
