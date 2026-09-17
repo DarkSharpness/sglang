@@ -2,7 +2,7 @@ import torch
 
 from sglang.kernels.jit.benchmark import marker
 from sglang.kernels.jit.benchmark.utils import create_random
-from sglang.kernels.ops.moe.moe_fused_gate import moe_fused_gate, moe_fused_gate_jit
+from sglang.kernels.ops.moe.moe_fused_gate import MoEGateImpl, moe_fused_gate
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(
@@ -44,13 +44,19 @@ def benchmark(num_tokens: int, num_experts: int, scoring_func: str, provider: st
         routed_scaling_factor=SCALE,
         apply_routed_scaling_factor_on_output=True,
     )
+    # Pin the backend on both: left to itself the entry point resolves every
+    # shape here to the JIT kernel, so the two rows would measure the same thing.
     if provider == "triton":
         return marker.do_bench(
-            moe_fused_gate, input_args=(scores, bias), input_kwargs=common
+            moe_fused_gate,
+            input_args=(scores, bias),
+            input_kwargs=dict(common, backend=MoEGateImpl.TRITON),
         )
     if provider == "jit":
         return marker.do_bench(
-            moe_fused_gate_jit, input_args=(scores, bias), input_kwargs=common
+            moe_fused_gate,
+            input_args=(scores, bias),
+            input_kwargs=dict(common, backend=MoEGateImpl.JIT),
         )
     if provider == "torch":
         return marker.do_bench(

@@ -4,7 +4,7 @@ The Triton kernel is a drop-in reimplementation of the CUDA fused gate for the
 ungrouped case (``num_expert_group == 1``). We validate it three ways:
 
 * against an explicit, definition-based torch reference (documents the math),
-* against the CUDA JIT kernel it mirrors (:func:`moe_fused_gate_jit`), and
+* against the CUDA JIT kernel it mirrors (``backend=MoEGateImpl.JIT``), and
 * against the production ``biased_grouped_topk_impl`` for the sigmoid / no-shared
   path that the kernel actually replaces in ``topk.py``.
 
@@ -24,7 +24,7 @@ import pytest
 import torch
 
 from sglang.kernels.jit.utils import get_ci_test_range
-from sglang.kernels.ops.moe.moe_fused_gate import moe_fused_gate, moe_fused_gate_jit
+from sglang.kernels.ops.moe.moe_fused_gate import MoEGateImpl, moe_fused_gate
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=8, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -192,8 +192,10 @@ def test_moe_fused_gate_matches_cuda_jit(
         routed_scaling_factor=2.5,
         apply_routed_scaling_factor_on_output=True,
     )
-    triton_w, triton_i = moe_fused_gate(scores, bias, **kwargs)
-    cuda_w, cuda_i = moe_fused_gate_jit(scores, bias, **kwargs)
+    triton_w, triton_i = moe_fused_gate(
+        scores, bias, backend=MoEGateImpl.TRITON, **kwargs
+    )
+    cuda_w, cuda_i = moe_fused_gate(scores, bias, backend=MoEGateImpl.JIT, **kwargs)
     torch.cuda.synchronize()
 
     num_columns = num_experts + num_shared

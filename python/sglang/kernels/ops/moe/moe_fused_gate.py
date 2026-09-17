@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import logging
+import enum
 from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
@@ -13,9 +13,11 @@ from sglang.kernels.jit.utils import (
     get_jit_cuda_arch,
     is_arch_support_pdl,
     load_jit,
+    make_cpp_args,
 )
 from sglang.kernels.kernel_api_logging import debug_kernel_api
 from sglang.kernels.ops.moe import moe_route_radix
+from sglang.kernels.spec import PlatformInfo
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -26,70 +28,71 @@ _SCORING_FUNC_MAP = {
     "softmax": 2,
 }
 
+_SCORING_FUNC_CPP_NAME_MAP = {
+    "sigmoid": "SIGMOID",
+    "sqrtsoftplus": "SQRTSOFTPLUS",
+}
+
 
 @cache_once
-def _jit_moe_fused_gate_module() -> Module:
+def _jit_moe_fused_gate_module(
+    scores_dtype: torch.dtype,
+    bias_dtype: Optional[torch.dtype],
+    num_experts: int,
+    topk_routed: int,
+    scoring_func: str,
+    use_pdl: bool,
+) -> Module:
+    args = make_cpp_args(
+        scores_dtype,
+        bias_dtype if bias_dtype is not None else "void",
+        num_experts,
+        topk_routed,
+        _SCORING_FUNC_CPP_NAME_MAP[scoring_func],
+        use_pdl,
+    )
     return load_jit(
         "moe_fused_gate",
+        *args,
         cuda_files=["moe/moe_fused_gate.cuh"],
-        cuda_wrappers=[("moe_fused_gate", "MoEFusedGateKernel::run")],
+        cuda_wrappers=[("run", f"moe_fused_gate<{args}>")],
+        extra_cuda_cflags=["-O3", "--use_fast_math"],
     )
 
 
-@cache_once
-def can_use_moe_fused_gate() -> bool:
-    logger = logging.getLogger(__name__)
-    try:
-        _jit_moe_fused_gate_module()
-        return True
-    except Exception as e:
-        logger.warning(f"Failed to load JIT MoE fused gate kernel: {e}")
-        return False
-
-
-def moe_fused_gate_jit(
-    input: torch.Tensor,
-    bias: torch.Tensor,
+# NOTE: internal API, without any input check
+def _moe_fused_gate_jit(
+    scores: torch.Tensor,
+    bias: Optional[torch.Tensor],
     topk: int,
-    scoring_func: str = "sigmoid",
-    num_fused_shared_experts: int = 0,
-    renormalize: bool = True,
-    routed_scaling_factor: float = 1.0,
-    apply_routed_scaling_factor_on_output: bool = False,
+    scoring_func: str,
+    num_fused_shared_experts: int,
+    renormalize: bool,
+    routed_scaling_factor: float,
+    apply_routed_scaling_factor_on_output: bool,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    scoring_func_int = _SCORING_FUNC_MAP.get(scoring_func.lower())
-    assert scoring_func_int is not None, (
-        f"Unknown scoring_func '{scoring_func}', must be one of {list(_SCORING_FUNC_MAP.keys())}"
+    num_rows, num_experts = scores.shape
+    module = _jit_moe_fused_gate_module(
+        scores.dtype,
+        bias.dtype if bias is not None else None,
+        num_experts,
+        topk - num_fused_shared_experts,
+        scoring_func,
+        is_arch_support_pdl(),
     )
-
-    assert input.dtype == torch.float32, "input must be float32"
-    assert bias.dtype == torch.float32, "bias must be float32"
-    assert input.ndim == 2, "input must be 2D"
-    assert bias.ndim == 1, "bias must be 1D"
-    assert input.size(1) == bias.size(0), "input and bias must have same num_experts"
-    assert topk > num_fused_shared_experts, "topk must be > num_fused_shared_experts"
-
-    num_rows, _ = input.shape
-    device = input.device
-
-    output = torch.empty(num_rows, topk, dtype=torch.float32, device=device)
-    indices = torch.empty(num_rows, topk, dtype=torch.int32, device=device)
-
-    module = _jit_moe_fused_gate_module()
-    module.moe_fused_gate(
-        input,
+    weights = torch.empty((num_rows, topk), dtype=torch.float32, device=scores.device)
+    indices = torch.empty((num_rows, topk), dtype=torch.int32, device=scores.device)
+    module.run(
+        scores,
         bias,
-        output,
+        weights,
         indices,
-        topk,
-        scoring_func_int,
-        num_fused_shared_experts,
         renormalize,
-        routed_scaling_factor,
+        float(routed_scaling_factor),
         apply_routed_scaling_factor_on_output,
+        num_fused_shared_experts,
     )
-
-    return output, indices
+    return weights, indices
 
 
 @triton.jit
@@ -315,6 +318,68 @@ def _router_triton_kernel(
         tl.store(out_p_ptr, packed, mask=store_mask)
 
 
+class MoEGateImpl(enum.Enum):
+    TRITON = enum.auto()
+    JIT = enum.auto()
+    JIT_RADIX = enum.auto()
+
+
+_platform = PlatformInfo.detect()
+
+
+def _resolve_moe_gate_backend(
+    scores: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    topk: int,
+    scoring_func: str,
+    num_fused_shared_experts: int,
+    moe_softcapping: float,
+    num_expert_group: int,
+    topk_group: int,
+    has_extras: bool,
+) -> MoEGateImpl:
+    """Pick an implementation.
+
+    ``has_extras`` means the caller asked for something only the Triton kernel
+    implements: a token-dependent bias, row padding, a renormalize epsilon, or
+    the packed output.
+    """
+    if has_extras:
+        return MoEGateImpl.TRITON
+    # Radix-select replaces the K dependent argmax rounds with a single CTA per
+    # token, keys register-resident, ids bit-identical to Triton including ties.
+    # It returns winners in expert-id order, which downstream MoE kernels do not
+    # care about. 3.1-3.5x over Triton at [1..8192, 896] top-16 on B200.
+    if (
+        scoring_func == "sigmoid"
+        and num_fused_shared_experts == 0
+        and num_expert_group <= 1
+        and topk_group == 1
+        and moe_softcapping == 0.0
+        and bias is not None
+        and bias.stride(0) == 1
+        and moe_route_radix.covered(scores, bias, topk)
+    ):
+        return MoEGateImpl.JIT_RADIX
+    if (
+        _platform.is_cuda
+        and scoring_func in _SCORING_FUNC_CPP_NAME_MAP
+        and num_expert_group <= 1
+        and topk_group == 1
+        and moe_softcapping == 0.0
+        # One warp emits one token's whole output, one slot per lane.
+        and topk <= 32
+        # An expert count that fills whole warps needs no bounds check; padding
+        # it costs scalar loads and a predicate, which at a few tokens is slower
+        # than Triton.
+        and scores.size(1) % 32 == 0
+        and scores.is_contiguous()
+        and (bias is None or bias.stride(0) == 1)
+    ):
+        return MoEGateImpl.JIT
+    return MoEGateImpl.TRITON
+
+
 @debug_kernel_api
 def moe_fused_gate(
     scores: torch.Tensor,
@@ -335,10 +400,12 @@ def moe_fused_gate(
     num_token_non_padded: Optional[torch.Tensor] = None,
     renormalize_epsilon: float = 0.0,
     packed_out: Optional[torch.Tensor] = None,
+    backend: Optional[MoEGateImpl] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Triton fused router: scoring + bias + topk + (optional) renorm/scale.
+    """Fused router: scoring + bias + topk + (optional) renorm/scale.
 
-    Mirrors the semantics of :func:`moe_fused_gate_jit` (the CUDA JIT kernel).
+    ``backend`` pins an implementation; left unset it is resolved from the
+    config, preferring the radix and CUDA JIT kernels where they apply.
     With ``num_expert_group > 1`` it performs DeepSeek-V3 grouped routing
     (per-group top-2-sum group scores, keep ``topk_group`` groups, then top-k
     within). ``scores`` contains raw GEMM logits.
@@ -391,34 +458,46 @@ def moe_fused_gate(
     if routed_scaling_factor is None:
         routed_scaling_factor = 1.0
 
-    # K3 radix-select fast path: native-CUDA radix-select replaces the 16
-    # dependent argmax rounds (single CTA per token; ids bit-identical to this
-    # triton kernel incl. ties).
-    # The radix kernel keeps keys register-resident and returns winners in
-    # expert-id order (skipping the biased-descending sort; downstream MoE
-    # kernels are order-insensitive). It is 3.1-3.5x faster than the Triton
-    # kernel at [1..8192, 896] top-16 on B200.
-    if (
-        scoring_func.lower() == "sigmoid"
-        and num_fused_shared_experts == 0
-        and num_expert_group <= 1
-        and moe_softcapping == 0.0
-        and input_ids is None
-        and num_token_non_padded is None
-        and renormalize_epsilon == 0.0
-        and packed_out is None
-        and bias.stride(0) == 1
-    ):
-        radix_args = (
+    if backend is None:
+        backend = _resolve_moe_gate_backend(
             scores,
             bias,
+            topk,
+            scoring_func,
+            num_fused_shared_experts,
+            moe_softcapping,
+            num_expert_group,
+            topk_group,
+            has_extras=(
+                input_ids is not None
+                or num_token_non_padded is not None
+                or renormalize_epsilon != 0.0
+                or packed_out is not None
+            ),
+        )
+
+    if backend == MoEGateImpl.JIT_RADIX:
+        return moe_route_radix.route_radix(
+            scores,
+            bias,  # type: ignore
             topk,
             renormalize,
             routed_scaling_factor,
             apply_routed_scaling_factor_on_output,
+            sorted=False,
         )
-        if moe_route_radix.covered(scores, bias, topk):
-            return moe_route_radix.route_radix(*radix_args, sorted=False)
+
+    if backend == MoEGateImpl.JIT:
+        return _moe_fused_gate_jit(
+            scores,
+            bias,
+            topk,
+            scoring_func,
+            num_fused_shared_experts,
+            renormalize,
+            routed_scaling_factor,
+            apply_routed_scaling_factor_on_output,
+        )
 
     M, N = scores.shape
     K = topk
