@@ -70,6 +70,11 @@ def _jit_cuda_version() -> tuple[int, ...]:
     return get_cuda_version()
 
 
+def get_jit_cuda_version() -> tuple[int, ...]:
+    """``(major, minor)`` of the nvcc JIT builds run (see `_jit_cuda_version`)."""
+    return _jit_cuda_version()
+
+
 def _cuda_arch_suffix(major: int, minor: int) -> str:
     """Mirror FlashInfer's `_normalize_cuda_arch`: 9.x/10.x+ -> "a"; 12.0 -> "f"
     and 12.x (x>0) -> "a" (SM120/SM121 need separate cubins to avoid
