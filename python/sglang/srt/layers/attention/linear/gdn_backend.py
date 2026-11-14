@@ -363,6 +363,9 @@ def _validate_gdn_target_verify_layout(model_runner: ModelRunner) -> None:
         )
 
 
+from sglang.srt.layers.attention.linear import leapquant_gdn  # noqa: E402
+
+
 class GDNKernelDispatcher:
     """Dispatches GDN kernel calls to the appropriate backend per mode."""
 
@@ -678,7 +681,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
     def supports_prefill_graph_extend(self) -> bool:
         # Read here, not in __init__: the support check reads model_config.
         return (
-            envs.SGLANG_ENABLE_GDN_PREFILL_GRAPH_EXTEND.get()
+            not leapquant_gdn.ENABLED
+            and envs.SGLANG_ENABLE_GDN_PREFILL_GRAPH_EXTEND.get()
             # drafts keep their eager GDN extend; only the target's is captured
             and not self.is_draft_worker
             and self._prefill_graph_extend_supported()
@@ -1131,6 +1135,19 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 conv_state_indices=cache_indices,
             )
 
+        if leapquant_gdn.ENABLED:
+            # LeapQuant reference (accuracy only): verify T=1 + commit n=1 on the format in the slot.
+            assert replayssm_d is None, "LeapQuant reference does not support ReplaySSM"
+            core_attn_out = leapquant_gdn.decode(
+                layer, ssm_states, cache_indices, mixed_qkv, a, b
+            )
+            if forward_batch.mamba_track_mask is not None:
+                leapquant_gdn._log_once("track_decode_bytecopy")
+            self._track_mamba_state_decode(
+                forward_batch, conv_states, ssm_states, cache_indices, layer.layer_id
+            )
+            return (core_attn_out, z) if return_z else core_attn_out
+
         # Skip split + reshape + separate gating kernel by consuming
         # the packed mixed_qkv directly in a single fused Triton kernel.
         if self.kernel_dispatcher.supports_packed_decode:
@@ -1334,6 +1351,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         conv_states = mamba_cache_params.conv[0]
         ssm_states = mamba_cache_params.temporal
         if self.mis_metadata is not None:
+            assert not leapquant_gdn.ENABLED, "LeapQuant reference does not cover MIS"
             if is_target_verify:
                 raise ValueError("GDN MIS does not support target verify")
             return self._forward_extend_mis(
@@ -1466,7 +1484,23 @@ class GDNAttnBackend(MambaAttnBackendBase):
             # ReplaySSM verify protocols: fold-every-commit (ring-write during
             # verify, fold on commit), circular ring, or the snapshotting
             # fallback when neither ring is allocated.
-            if use_replayssm_fold:
+            if leapquant_gdn.ENABLED:
+                # LeapQuant reference: reads the slot format, writes the draft
+                # records into the slot; the commit advances the window.
+                assert retrieve_parent_token is None, "LeapQuant: chain verify only"
+                assert not (use_replayssm_fold or use_replayssm_spec)
+                core_attn_out = leapquant_gdn.target_verify(
+                    layer,
+                    ssm_states,
+                    cache_indices,
+                    query,
+                    key,
+                    value,
+                    a,
+                    b,
+                    forward_batch.spec_info.draft_token_num,
+                )
+            elif use_replayssm_fold:
                 core_attn_out = self._replayssm_fold_target_verify(
                     layer=layer,
                     query=query,
@@ -1522,6 +1556,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     retrieve_parent_token=retrieve_parent_token,
                     stable_rows=pp_spec_stable_rows_enabled(),
                 )
+            leapquant_gdn.debug_dump("verify", layer.layer_id, core_attn_out)
         else:
             if self.kernel_dispatcher.extend_kernel.defers_prefill_gates:
                 g = beta = None
@@ -1541,6 +1576,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     dtype=torch.float32,
                     device=ssm_states.device,
                 )
+            if leapquant_gdn.ENABLED:
+                # LeapQuant reference: slots back to fp32 for the production kernel.
+                assert not needs_state_gather, "LeapQuant: contiguous pool only"
+                leapquant_gdn.unpack_slots_inplace(ssm_states, cache_indices)
             core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
                 q=query,
                 k=key,
@@ -1599,6 +1638,36 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     forward_metadata,
                     h_track_buf=h_track_buf,
                 )
+
+            if leapquant_gdn.ENABLED:
+                # LeapQuant reference: pack the final states and every tracking
+                # slot the extend wrote in fp32.
+                lq_layer = self.state_layer_indices.get(layer.layer_id, 0)
+                leapquant_gdn.pack_slots_inplace(
+                    ssm_states, cache_indices, layer_idx=lq_layer
+                )
+                if forward_metadata.has_mamba_track_mask:
+                    if forward_metadata.track_ssm_h_src.numel() > 0:
+                        leapquant_gdn.pack_slots_inplace(
+                            ssm_states,
+                            forward_metadata.track_ssm_h_dst,
+                            tag="pack_track_track_ssm_h_dst",
+                            layer_idx=lq_layer,
+                        )
+                    if forward_metadata.track_ssm_recompute_dst is not None:
+                        leapquant_gdn.pack_slots_inplace(
+                            ssm_states,
+                            forward_metadata.track_ssm_recompute_dst,
+                            tag="pack_track_track_ssm_recompute_dst",
+                            layer_idx=lq_layer,
+                        )
+                    if forward_metadata.track_ssm_final_src.numel() > 0:
+                        leapquant_gdn.pack_slots_inplace(
+                            ssm_states,
+                            forward_metadata.track_ssm_final_dst,
+                            tag="pack_track_track_ssm_final_dst",
+                            layer_idx=lq_layer,
+                        )
 
         return core_attn_out
 

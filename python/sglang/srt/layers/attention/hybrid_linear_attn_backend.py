@@ -1754,6 +1754,43 @@ class HybridLinearAttnBackend(AttentionBackend):
             )
             return
 
+        from sglang.srt.layers.attention.linear import leapquant_gdn
+
+        if leapquant_gdn.ENABLED:
+            # LeapQuant reference: the verify wrote the draft records into the
+            # slot; conv windows commit as in production, the SSM side advances
+            # the window (l += n) and refits at l >= P.
+            from types import SimpleNamespace
+
+            assert src_indices_raw is None, "LeapQuant: no PP stable rows"
+            scatter_mamba_states_after_mtp_verify(
+                SimpleNamespace(
+                    temporal=mamba_caches.temporal.new_empty(0),
+                    intermediate_ssm=None,
+                    conv=mamba_caches.conv,
+                    intermediate_conv_window=mamba_caches.intermediate_conv_window,
+                ),
+                state_indices_tensor,
+                last_correct_step_indices,
+                mamba_track_indices,
+                mamba_steps_to_track,
+            )
+            leapquant_gdn.commit_after_verify(
+                mamba_caches.temporal,
+                state_indices_tensor,
+                last_correct_step_indices,
+                mamba_track_indices,
+                mamba_steps_to_track,
+            )
+            self._update_ple_state_after_mtp_verify(
+                state_indices_tensor,
+                last_correct_step_indices,
+                mamba_track_indices,
+                mamba_steps_to_track,
+                src_indices_raw,
+            )
+            return
+
         assert (
             mamba_caches.temporal.numel() == 0
             or mamba_caches.intermediate_ssm is not None
